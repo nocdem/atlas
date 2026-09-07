@@ -420,8 +420,14 @@ static void test_documented_tool_names_are_plugin_scoped_correctly(void) {
      * for named remote-submit keys only. The two write tools (`atlas_job_submit`
      * and `atlas_job_cancel`) extend the invariant: every tool that writes maps to
      * a scope no credential can be granted, and since A14 there are two such
-     * scopes. */
-    T_CHECK_MSG(n == 41, "expected 41 tools, found %zu", n);
+     * scopes.
+     *
+     * A14R added a fifth, `atlas_job_result`, on the same terms: remote-only,
+     * `ATLAS_SCOPE_JOBS_SUBMIT`, and — unlike the two write tools beside it —
+     * `writes = false`, so it publishes `readOnlyHint: true`. It reads what a
+     * finished job produced and applies, commits and approves nothing, which
+     * is why it does not lengthen the absent list above. */
+    T_CHECK_MSG(n == 42, "expected 42 tools, found %zu", n);
 }
 
 /* --- the integration record ----------------------------------------------

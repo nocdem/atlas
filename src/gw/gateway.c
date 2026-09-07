@@ -1073,6 +1073,11 @@ static const api_route API_WRITE_ROUTES[] = {
      {"repo", "task", "key", NULL}, {NULL}, ATLAS_GW_SUBMIT_BODY_MAX_BYTES},
     {"/api/v1/job/get", "job.remote_get", ATLAS_SCOPE_JOBS_SUBMIT,
      {"job", NULL}, {NULL}, ATLAS_GW_WRITE_BODY_MAX_BYTES},
+    /* A14R. The one read that returns bytes a worker's run produced. It takes
+     * the job and nothing else: there is no artifact name in this row, so the
+     * three files it can return are fixed by the daemon and not by a request. */
+    {"/api/v1/job/result", "job.remote_result", ATLAS_SCOPE_JOBS_SUBMIT,
+     {"job", NULL}, {NULL}, ATLAS_GW_WRITE_BODY_MAX_BYTES},
     {"/api/v1/job/list", "job.remote_list", ATLAS_SCOPE_JOBS_SUBMIT,
      {"after", "limit", NULL}, {"after", "limit", NULL}, ATLAS_GW_WRITE_BODY_MAX_BYTES},
     {"/api/v1/job/cancel", "job.remote_cancel", ATLAS_SCOPE_JOBS_SUBMIT,
@@ -2589,8 +2594,16 @@ atlas_status atlas_service_gateway_status_for(FILE *out, bool json, const atlas_
                                         p->remote_submit_max_active, err);
             }
             if (st == ATLAS_OK) {
+                /* A14R. Zero here means unlimited, the same as in the policy.
+                 * Emitted as the number rather than translated: a JSON reader
+                 * gets the value the policy holds, and the human renderer beside
+                 * it is where the word belongs. */
                 st = atlas_json_key_int(j, "remote_submit_max_per_day",
                                         p->remote_submit_max_per_day, err);
+            }
+            if (st == ATLAS_OK) {
+                st = atlas_json_key_int(j, "remote_submit_max_active_total",
+                                        p->remote_submit_max_active_total, err);
             }
             if (st == ATLAS_OK) {
                 st = atlas_json_key_bool(j, "cleartext_submission_accepted",
@@ -2685,12 +2698,32 @@ atlas_status atlas_service_gateway_status_for(FILE *out, bool json, const atlas_
                     (void)fprintf(out, "key_%s%s", p->remote_submit_keys[ki],
                                   ki + 1u < p->remote_submit_count ? " " : "");
                 }
+                /* A14R. Zero is a decision here, not an absence, so it is
+                 * printed as the word rather than as the number — an operator
+                 * reading "per day 0" would reasonably take it for a bound of
+                 * none-per-day, which is the opposite of what it means. The
+                 * machine-wide bound prints only when the policy named one,
+                 * because absent and unbounded are the same thing for it. */
+                char per_day[32];
+                if (p->remote_submit_max_per_day == 0) {
+                    (void)snprintf(per_day, sizeof per_day, "unlimited");
+                } else {
+                    (void)snprintf(per_day, sizeof per_day, "%lld",
+                                   p->remote_submit_max_per_day);
+                }
+                char total[64];
+                if (p->remote_submit_max_active_total > 0) {
+                    (void)snprintf(total, sizeof total, ", %lld active machine-wide",
+                                   p->remote_submit_max_active_total);
+                } else {
+                    total[0] = '\0';
+                }
                 (void)fprintf(out,
-                              "  (driver %s, mode %s, %zu gate(s), attempts %lld, active %lld, "
-                              "per day %lld; checked at submit)\n",
+                              "  (driver %s, mode %s, %zu gate(s), attempts %lld, active %lld"
+                              "%s, per day %s; checked at submit)\n",
                               p->remote_submit_driver, p->remote_submit_mode,
                               p->remote_submit_gate_count, p->remote_submit_max_attempts,
-                              p->remote_submit_max_active, p->remote_submit_max_per_day);
+                              p->remote_submit_max_active, total, per_day);
             } else {
                 (void)fprintf(out,
                               "submit:  (none -- nothing reachable over the network can queue a "

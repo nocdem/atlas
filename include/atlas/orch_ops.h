@@ -322,6 +322,11 @@ typedef struct atlas_orch_op {
     char remote_allowed_ids[ATLAS_GWPOLICY_MAX_SUBMIT_KEYS][ATLAS_APIKEY_SELECTOR_HEX + 1u];
     size_t remote_allowed_count;
     int64_t remote_max_active;
+    /* A14R. The machine-wide ceiling on active remote jobs, or zero when the
+     * policy names none. Carried on the op beside the per-credential bound and
+     * checked in the same transaction, so the two cannot disagree about what
+     * counts as active. */
+    int64_t remote_max_active_total;
     int64_t remote_max_per_day;
     bool peer_is_operator;
 } atlas_orch_op;
@@ -686,6 +691,12 @@ atlas_status atlas_db_orch_job_list_remote(atlas_db *db, int64_t after_id, int64
  * `submit_key_id = key_id` and state is not in the terminal set. */
 atlas_status atlas_db_orch_remote_active_count(atlas_db *db, const char *key_id, int64_t *out,
                                                atlas_err *err);
+
+/* A14R. Active remote jobs across every credential -- `submit_key_id <> ''` --
+ * for the machine-wide bound `remote_submit_max_active_total` names. Same
+ * definition of active as the per-credential count above, from one shared SQL
+ * predicate rather than a second spelling of it. */
+atlas_status atlas_db_orch_remote_active_total(atlas_db *db, int64_t *out, atlas_err *err);
 
 /* A14. Per-day root-submission budget for a credential: counts rows in
  * `orch_jobs` whose `submit_key_id = key_id`, `parent_job_uid = ''`, and

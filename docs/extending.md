@@ -1564,3 +1564,71 @@ When adding any per-credential bound (daily count, per-job cost, etc.):
 `ATLAS_REMOTE_SUBMIT_MAX_ACTIVE` (2 concurrent submissions, policy-overridable),
 `ATLAS_REMOTE_SUBMIT_MAX_PER_DAY` (6, policy-overridable),
 `ATLAS_REMOTE_SUBMIT_MAX_ATTEMPTS` (1 per job, policy-overridable).
+
+## A14R — the result surface, and what a new artifact there costs
+
+### Adding a name to the three A14R returns
+
+`job.remote_result` returns `result.txt`, `changes.patch` and `validations.txt`
+and takes no artifact parameter. That is the whole of what keeps it from being
+`job.remote_artifact` under another name, so a fourth name is a decision about
+the boundary and not a configuration change. Before adding one:
+
+1. **It must be composed by Atlas, not chosen by a worker.** Each of the three is
+   written by Atlas *after* the driver has exited, so a worker that plants a file
+   of that name is overwritten rather than believed. A name a worker picks is an
+   artifact, and artifacts stay unreachable from a remote credential.
+2. **Add it to `ATLAS_ORCH_RESULT_*_NAME` in `atlas/orch.h`, to
+   `artifact_name_travels_inline` in `src/orch/dispatch.c`, and to the `slots[]`
+   and `KEYS[]` arrays in `method_remote_result`.** Four places; the compiler
+   catches none of them, which is why the test in `tests/test_gw_submit.c`
+   asserts that `report.txt` is *not* returned.
+3. **Fit it inside `ATLAS_ORCH_RESULT_INLINE_TOTAL_MAX` (320 KiB raw).** Artifact
+   bytes travel hex-encoded on the completion and `ATLAS_IPC_MAX_REQUEST_BYTES`
+   is 1 MiB, so every raw byte costs two. A completion that does not fit is a
+   finished worker whose outcome never reaches the ledger — the budget is
+   checked per artifact against a running total, and an artifact over it is
+   described exactly as an oversized one is.
+4. **Say what its absence means.** Every slot emits `available`, and when false an
+   `unavailable_reason` that distinguishes "the attempt produced no such file"
+   from "it was too large to carry". A reader must never infer an empty result
+   from a missing field.
+
+### Adding an `atlas_orch_exit_kind` or an `atlas_orch_reason`
+
+Both switches in `src/orch/orch.c` have no `default:`, so a new member is a
+compile error there — that is deliberate and is the whole reminder mechanism.
+Beyond it, a new exit kind must be added to `KINDS[]` in
+`method_dispatch_complete` (`src/ipc/server_orch.c`) or the daemon reads it as
+UNKNOWN, and to `reason_for` in `src/orch/rundriver.c`; a new reason must be
+added to `REASONS[]` beside `KINDS[]` or a dispatcher cannot send it. Neither
+column has a schema CHECK, so **no migration is required and none was added** —
+which also means a stored value is never validated by SQLite and the C
+vocabulary is the only guard.
+
+### Adding an orchestration or gateway policy key
+
+An unrecognised key is an error, not a line that is skipped, in both loaders. A
+new numeric key is refused rather than clamped when out of range, and a policy
+that half-parses disables the surface it governs. Two shapes worth copying:
+
+- **`max_cost_usd`** (`src/orch/policy.c`) is a ceiling like the six beside it,
+  and is the one that is **not enforced by Atlas** — it becomes a flag the worker
+  applies to itself. A key whose name reads as a guarantee must say in its own
+  comment that it is not one.
+- **`remote_submit_max_active_total`** (`src/gw/gwpolicy.c`) is deliberately
+  *outside* the seven-key all-or-none set, because it is a ceiling over the
+  others rather than one of the values that describe what a submission is. A
+  machine that never wrote the line keeps A14's behaviour exactly.
+- **`remote_submit_max_per_day = 0`** is the one zero in that block that means
+  something. It stays inside the all-or-none set, so "unlimited" is reachable
+  only by writing it and never by omitting a line — which is what would make it
+  a default.
+
+### Bounds this season added
+
+`ATLAS_ORCH_RESULT_TEXT_MAX` (32 KiB), `ATLAS_ORCH_RESULT_GATES_MAX` (32 KiB),
+`ATLAS_ORCH_RESULT_INLINE_TOTAL_MAX` (320 KiB raw per completion),
+`ATLAS_ORCH_MAX_COST_CENTS` (\$10,000, policy-lowerable),
+`ATLAS_GWPOLICY_SUBMIT_MAX_ACTIVE_TOTAL_CEILING` (32, policy-lowerable).
+`ATLAS_ORCH_MAX_WALL_TIMEOUT_MS` moved from one hour to three.

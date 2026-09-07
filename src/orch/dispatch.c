@@ -430,6 +430,52 @@ static atlas_status run_validations(attempt *a, atlas_ws *ws, bool *passed, atla
         o.log_ud = ws;
         st = atlas_validations_run(cmds, n, &o, &gr, err);
     }
+    /* A14R. The gate verdicts, as an ordinary artifact, so a reviewer can see
+     * what was actually run and what it answered rather than inferring it from
+     * a job state.
+     *
+     * Composed by Atlas from Atlas' own values: the argv vectors come from the
+     * job's stored validation list, and `passed`, `ran` and `failed_index` are
+     * `atlas_validations_run`'s own verdicts. No worker prose enters it. The
+     * failing command's captured output is deliberately **not** here — it is
+     * already carried as the completion's `detail` field, bounded and redacted
+     * by the path that has always carried it, and a second copy on a second
+     * path is a second thing to keep bounded.
+     *
+     * Written whatever the outcome, and a workspace that will not take it does
+     * not fail the attempt: the gate's verdict is the answer, and losing the
+     * record of it is worse reported than fatal. */
+    if (st == ATLAS_OK) {
+        atlas_buf sum = ATLAS_BUF_INIT;
+        atlas_err ignore;
+        atlas_err_init(&ignore);
+        atlas_status ss =
+            atlas_buf_appendf(&sum, &ignore, "atlas-validations-1\npassed=%s\ndeclared=%zu\nran=%zu\n",
+                              gr.passed ? "yes" : "no", n, gr.ran);
+        for (size_t i = 0; ss == ATLAS_OK && i < n; i++) {
+            const char *verdict = "NOT_RUN";
+            if ((size_t)i < gr.ran) {
+                verdict = (gr.failed_index >= 0 && (size_t)gr.failed_index == i) ? "FAILED"
+                                                                                : "PASSED";
+            }
+            ss = atlas_buf_appendf(&sum, &ignore, "gate %zu %s:", i, verdict);
+            for (size_t k = 0; ss == ATLAS_OK && k < cmds[i].count; k++) {
+                ss = atlas_buf_appendf(&sum, &ignore, " %s", atlas_buf_cstr(&cmds[i].args[k]));
+            }
+            if (ss == ATLAS_OK) {
+                ss = atlas_buf_append(&sum, "\n", 1u, &ignore);
+            }
+            if (ss == ATLAS_OK && sum.len > (size_t)ATLAS_ORCH_RESULT_GATES_MAX) {
+                ss = atlas_buf_append(&sum, "(truncated)\n", 12u, &ignore);
+                break;
+            }
+        }
+        if (ss == ATLAS_OK) {
+            (void)atlas_ws_write(ws, "artifacts/" ATLAS_ORCH_RESULT_GATES_NAME, sum.data, sum.len,
+                                 &ignore);
+        }
+        atlas_buf_free(&sum);
+    }
     *passed = st == ATLAS_OK && gr.passed;
     if (st == ATLAS_OK && !gr.passed && gr.failed_index >= 0) {
         emit_event(a, "validation", "a declared validation command did not pass");
@@ -728,9 +774,42 @@ static bool artifacts_travel_inline(const attempt *a) {
     return d != NULL && d->role == ATLAS_DRIVER_ROLE_PLANNER;
 }
 
+/* A14R. The three artifacts that travel for *every* driver, whatever its role.
+ *
+ * The paragraph above says a name test "would silently stop applying the moment
+ * the plan layer named a second file", and that is still the right reason for
+ * the planner's rule to be asked of the role. This is the other half of the
+ * same question and it has the opposite answer: these three names are the whole
+ * of what a *reviewer* needs, they are each produced by Atlas rather than by a
+ * worker, and the set is closed by construction — there is no future file that
+ * belongs to it without somebody adding a line here on purpose.
+ *
+ * Everything else keeps A8's behaviour exactly: described, digested, and left
+ * in a workspace an operator can reach. What changed is that a successful
+ * attempt's workspace is removed, so for these three "left in the workspace"
+ * meant "destroyed" — measured on this machine, job `j61d9fbb…` SUCCEEDED on
+ * 2026-09-06 and its attempt directory holds nothing today. */
+static bool artifact_name_travels_inline(const char *name) {
+    static const char *const NAMES[] = {ATLAS_ORCH_RESULT_TEXT_NAME, ATLAS_ORCH_RESULT_PATCH_NAME,
+                                        ATLAS_ORCH_RESULT_GATES_NAME, NULL};
+    for (size_t i = 0; NAMES[i] != NULL; i++) {
+        if (strcmp(name, NAMES[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static atlas_status build_complete(atlas_json *j, void *ud, atlas_err *err) {
     done_args *d = (done_args *)ud;
     const bool inline_content = artifacts_travel_inline(d->a);
+    /* A14R. Raw bytes already promised to this frame. Hex doubles every one of
+     * them and `ATLAS_IPC_MAX_REQUEST_BYTES` is the ceiling on the whole
+     * request, so the running total is checked before an artifact is added
+     * rather than after: a completion that does not fit is not a truncated
+     * artifact, it is a finished worker whose outcome never reaches the ledger.
+     * An artifact this refuses is described exactly as an oversized one is. */
+    size_t inline_budget_used = 0;
     atlas_status st = atlas_json_key_str(j, "token", atlas_buf_cstr(&d->a->token), err);
     if (st == ATLAS_OK) {
         st = atlas_json_key_bool(j, "success", d->success, err);
@@ -746,6 +825,41 @@ static atlas_status build_complete(atlas_json *j, void *ud, atlas_err *err) {
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_int(j, "pid", (int64_t)getpid(), err);
+    }
+    /* A14R. What the attempt cost, encoded the way the run driver has encoded it
+     * since A10.0 and decoded by the `usage` key `dispatch.complete` has
+     * accepted since A10.0 — both halves already existed and nothing joined
+     * them, so every job that ran through *this* dispatcher wrote an
+     * `orch_usage` row with a NULL cost, a NULL turn count and an empty model.
+     * `present` was true because the completion wrote a row; every field in it
+     * was empty because the completion carried nothing to put there. Measured:
+     * `job.remote_get` on `j61d9fbb…` reports `usage.present` and no model.
+     *
+     * The run driver reaches the write point in its own process and assigns
+     * `op->usage` directly (`rundriver.c`); a dispatcher is a separate process
+     * and has to send it. A failure to encode costs the measurement and never
+     * the completion — losing the outcome to save the number would be the wrong
+     * trade, and it is the trade A10.0 already refused at the parsing end. */
+    if (st == ATLAS_OK && d->dr->usage.status != ATLAS_USAGE_UNKNOWN) {
+        atlas_buf enc = ATLAS_BUF_INIT;
+        atlas_err ignore;
+        atlas_err_init(&ignore);
+        if (atlas_usage_encode(&d->dr->usage, &enc, &ignore) == ATLAS_OK) {
+            st = atlas_json_key_str(j, "usage", atlas_buf_cstr(&enc), err);
+        }
+        atlas_buf_free(&enc);
+    }
+    /* A14R. The one failure whose *kind* this dispatcher can establish.
+     *
+     * `dispatch.complete` matches this against its own closed vocabulary and
+     * ignores anything else, so this names a value or names nothing. It is set
+     * from Atlas' own classification of the exit — never from a sentence a
+     * worker wrote — and it exists so a reader can tell "stopped at the dollar
+     * bound" from "crashed", which are the same NONZERO exit from outside. */
+    if (st == ATLAS_OK && !d->success &&
+        d->dr->exit_kind == ATLAS_ORCH_EXIT_BUDGET_EXHAUSTED) {
+        st = atlas_json_key_str(j, "reason",
+                                atlas_orch_reason_name(ATLAS_ORCH_REASON_BUDGET_EXHAUSTED), err);
     }
     if (st == ATLAS_OK && d->nart > 0) {
         st = atlas_json_key(j, "artifact", err);
@@ -765,7 +879,13 @@ static atlas_status build_complete(atlas_json *j, void *ud, atlas_err *err) {
              * run driver spells it. The daemon re-digests what arrives and
              * refuses a manifest that describes one thing and carries another,
              * so this is a carriage and never a claim. */
-            if (st == ATLAS_OK && inline_content && d->arts[i].content_stored) {
+            const bool wanted =
+                inline_content || artifact_name_travels_inline(atlas_buf_cstr(&d->arts[i].name));
+            const bool fits =
+                d->arts[i].content.len <=
+                (size_t)ATLAS_ORCH_RESULT_INLINE_TOTAL_MAX - inline_budget_used;
+            if (st == ATLAS_OK && wanted && fits && d->arts[i].content_stored) {
+                inline_budget_used += d->arts[i].content.len;
                 st = atlas_buf_append(&ent, "\x1f", 1u, err);
                 static const char HEX[] = "0123456789abcdef";
                 for (size_t k = 0; st == ATLAS_OK && k < d->arts[i].content.len; k++) {
@@ -886,6 +1006,7 @@ static atlas_status run_attempt(attempt *a, atlas_err *err) {
         /* A12.0. The same helper the foreground run driver uses, so the two
          * paths cannot disagree about which model a role runs under. */
         req.model = atlas_driver_model_for(drv, &o->models);
+        req.max_cost_cents = o->max_cost_cents;
         st = drv->run(&req, &dr, err);
     }
     atlas_buf_free(&composed);

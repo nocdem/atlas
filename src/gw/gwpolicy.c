@@ -366,6 +366,7 @@ void atlas_gwpolicy_parse_buffer(const char *buf, size_t total, atlas_gwpolicy *
     bool submit_gate_given = false;
     bool submit_attempts_given = false;
     bool submit_active_given = false;
+    bool submit_active_total_given = false;
     bool submit_per_day_given = false;
     bool submit_accept_given = false;
 
@@ -708,14 +709,35 @@ void atlas_gwpolicy_parse_buffer(const char *buf, size_t total, atlas_gwpolicy *
             out->remote_submit_max_active = num;
             submit_active_given = true;
         } else if (take_value(line, len, "remote_submit_max_per_day", &val, &vlen)) {
-            /* A14: 1..ATLAS_GWPOLICY_SUBMIT_MAX_PER_DAY_CEILING (64). */
+            /* A14: 1..ATLAS_GWPOLICY_SUBMIT_MAX_PER_DAY_CEILING (64).
+             * A14R: 0 is admitted and means **no daily bound**. Everything else
+             * out of range is still MALFORMED — this widens exactly one value
+             * and leaves the fail-closed reading of every other one alone. The
+             * key stays in the all-or-none set, so unlimited is reachable only
+             * by writing `0`, never by omitting the line. */
             if (submit_per_day_given || !parse_number(val, vlen, &num) ||
-                num < 1 || num > ATLAS_GWPOLICY_SUBMIT_MAX_PER_DAY_CEILING) {
+                num < 0 || num > ATLAS_GWPOLICY_SUBMIT_MAX_PER_DAY_CEILING) {
                 out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
                 return;
             }
             out->remote_submit_max_per_day = num;
             submit_per_day_given = true;
+        } else if (take_value(line, len, "remote_submit_max_active_total", &val, &vlen)) {
+            /* A14R: 1..ATLAS_GWPOLICY_SUBMIT_MAX_ACTIVE_TOTAL_CEILING (32).
+             *
+             * Deliberately **not** in the all-or-none set: it is a ceiling over
+             * the others rather than one of the seven values that describe what
+             * a submission is, and a machine that never named one keeps A14's
+             * behaviour exactly. Zero is refused rather than read as unbounded,
+             * because an operator who wrote `0` here meant a bound and would
+             * otherwise get the opposite of one; unbounded is the absent line. */
+            if (submit_active_total_given || !parse_number(val, vlen, &num) || num < 1 ||
+                num > ATLAS_GWPOLICY_SUBMIT_MAX_ACTIVE_TOTAL_CEILING) {
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+            out->remote_submit_max_active_total = num;
+            submit_active_total_given = true;
         } else if (take_value(line, len, "operator_accepts_cleartext_submission", &val, &vlen)) {
             /* A14. One legal value, deliberately narrower than `parse_bool`:
              * this records a person's written acceptance of a stated risk.

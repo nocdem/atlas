@@ -1,9 +1,12 @@
 /* Atlas - A14: the gateway's remote job submission group.
  * Copyright 2026 The Atlas Authors. Licensed under the Apache License 2.0.
  *
- * This file holds the four methods the gateway's uid may call to queue, query
- * and cancel jobs submitted through bearer credentials: `job.remote_submit`,
- * `job.remote_get`, `job.remote_list`, `job.remote_cancel`.
+ * This file holds the methods the gateway's uid may call to queue, query and
+ * cancel jobs submitted through bearer credentials: `job.remote_submit`,
+ * `job.remote_get`, `job.remote_list`, `job.remote_cancel`, and — from A14R —
+ * `job.remote_result`, which returns the three artifacts Atlas itself produced
+ * for one terminal job. The revision A14R makes to Decision 7 is argued in full
+ * above `method_remote_result` below, and in `docs/remote-submission.md`.
  *
  * ## Why this is a third table, not part of server_orch.c
  *
@@ -33,10 +36,15 @@
  * `job.remote_apply`, `job.remote_artifact`, `job.remote_log`,
  * `job.remote_run` are forbidden names that must never exist in the protocol.
  * `tests/test_orch_rpc.c` scans for them.  The reason for each: "apply" is a
- * lifecycle transition reserved for the decision layer; "artifact" would
- * expose a worker's output to a remote credential, closing the chain Decision 7
- * writes down but does not close; "log" likewise; "run" is the dispatch-level
- * concept the gateway may not touch.
+ * lifecycle transition reserved for the decision layer; "artifact" would let a
+ * remote credential name a file a *worker* chose to write; "log" would hand
+ * over an unbounded transcript; "run" is the dispatch-level concept the gateway
+ * may not touch.
+ *
+ * A14R did not weaken any of the four. `job.remote_result` is not `artifact`
+ * under another name: it takes no artifact parameter, so the three names it can
+ * return are a property of its signature rather than of a check, and each of
+ * the three is composed by Atlas rather than chosen by a worker.
  */
 #include <stddef.h>
 #include <stdint.h>
@@ -347,6 +355,7 @@ static atlas_status method_remote_submit(dispatch_state *ds, const atlas_ipc_req
     if (st == ATLAS_OK) {
         op->remote_max_active = gw->remote_submit_max_active;
         op->remote_max_per_day = gw->remote_submit_max_per_day;
+        op->remote_max_active_total = gw->remote_submit_max_active_total;
         op->remote_allowed_count = gw->remote_submit_count;
         for (size_t i = 0; i < gw->remote_submit_count; i++) {
             (void)snprintf(op->remote_allowed_ids[i], ATLAS_APIKEY_SELECTOR_HEX + 1u, "%s",
@@ -587,6 +596,316 @@ static atlas_status method_remote_get(dispatch_state *ds, const atlas_ipc_reques
     return st;
 }
 
+/* --- job.remote_result -----------------------------------------------------
+ *
+ * A14's Decision 7 said "no artifact, no log, no gate output travels a remote
+ * route or tool", called the resulting gap "the transcript chain", and offered
+ * no fix. **A14R revises it, narrowly and on purpose**, and the revision is
+ * written in `docs/remote-submission.md` beside the original.
+ *
+ * What Decision 7 was protecting is unchanged and is still enforced here: a
+ * remote credential may not name an artifact, may not ask for a log, and may
+ * not reach anything a worker chose to write. `job.remote_apply`,
+ * `job.remote_artifact`, `job.remote_log` and `job.remote_run` remain forbidden
+ * names and `tests/test_orch_rpc.c` still scans for them.
+ *
+ * What it was costing is what changed. A steward who submits work and is shown
+ * only a state cannot review it, and cannot decide whether to apply it — so the
+ * human approval gate that the whole arrangement rests on had nothing to read.
+ * The path A14 named instead, "the Atlas machine and the terminal command
+ * `atlas job artifact`", **did not exist**: there is no such subcommand, and
+ * for an executor driver the bytes were destroyed with the workspace anyway.
+ * A guarantee whose escape hatch is not implemented is not a narrower channel,
+ * it is a wider one that nobody can audit.
+ *
+ * The revision is bounded by construction rather than by a check:
+ *
+ *   - Three names, fixed in `atlas/orch.h`, each produced by Atlas: the patch
+ *     from a content diff of the two trees, the gate summary from Atlas' own
+ *     verdicts, the answer from the final record of the stream Atlas captured.
+ *     There is no parameter here that selects an artifact, so "a caller may not
+ *     name one" is a property of the signature.
+ *   - Every one is UNTRUSTED_DATA, safe-encoded at this boundary exactly as
+ *     `job.artifact` encodes what it returns, and read by no branch anywhere.
+ *   - The credential must be the one that submitted the job, and the job's
+ *     repository must still be one the orchestration policy permits. Both are
+ *     re-checked here rather than inherited: a repository removed from the
+ *     policy stops being readable, which is what makes the policy a live grant
+ *     instead of a record of one.
+ *   - It applies nothing, commits nothing, starts no process and writes no row.
+ */
+
+/* One artifact this method may return, filled by the row callback. */
+typedef struct result_slot {
+    const char *name;
+    bool found;
+    bool stored;
+    int64_t size_bytes;
+    char sha256[ATLAS_SHA256_HEX_LEN + 1u];
+    atlas_buf content;
+} result_slot;
+
+typedef struct result_ctx {
+    result_slot *slots;
+    size_t count;
+} result_ctx;
+
+static atlas_status take_result_artifact(const atlas_orch_artifact_row *row, void *ud,
+                                         atlas_err *err) {
+    result_ctx *rc = (result_ctx *)ud;
+    for (size_t i = 0; i < rc->count; i++) {
+        result_slot *s = &rc->slots[i];
+        if (row->name == NULL || strcmp(row->name, s->name) != 0) {
+            continue;
+        }
+        /* Newest attempt wins: the rows arrive in id order and a later attempt
+         * describes the state the job actually ended in. An earlier attempt's
+         * patch is not a smaller answer, it is a different one. */
+        s->found = true;
+        s->size_bytes = row->size_bytes;
+        (void)snprintf(s->sha256, sizeof(s->sha256), "%s", row->sha256 != NULL ? row->sha256 : "");
+        atlas_buf_free(&s->content);
+        atlas_buf_init(&s->content);
+        s->stored = false;
+        if (row->content_stored && row->content != NULL) {
+            if (atlas_buf_set(&s->content, row->content, row->content_len, err) != ATLAS_OK) {
+                return ATLAS_ERR_INTERNAL;
+            }
+            s->stored = true;
+        }
+        return ATLAS_OK;
+    }
+    return ATLAS_OK;
+}
+
+/* Emits one artifact as an object under its own key.
+ *
+ * `available` is always present and is the field a reader checks first; when it
+ * is false, `unavailable_reason` says which of the three things happened rather
+ * than leaving an empty string to be interpreted. A digest and a size are
+ * emitted whenever the row exists at all, so a reader who cannot be given the
+ * bytes can still say what they were. */
+static atlas_status emit_result_slot(dispatch_state *ds, const result_slot *s, const char *key,
+                                     atlas_err *err) {
+    atlas_status st = atlas_json_key(ds->j, key, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_obj_begin(ds->j, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_bool(ds->j, "available", s->found && s->stored, err);
+    }
+    if (st == ATLAS_OK && s->found) {
+        st = atlas_json_key_int(ds->j, "size_bytes", s->size_bytes, err);
+    }
+    if (st == ATLAS_OK && s->found && s->sha256[0] != '\0') {
+        st = atlas_json_key_str(ds->j, "sha256", s->sha256, err);
+    }
+    if (st == ATLAS_OK && s->found && s->stored) {
+        /* A model's output, and the patch Atlas derived from what it did:
+         * UNTRUSTED_DATA, labelled and safe-encoded, so a patch full of control
+         * bytes cannot reach a terminal as escapes. The same two lines
+         * `job.artifact` emits, for the same reason. */
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "encoding", "atlas-safe-1", err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "provenance", "UNTRUSTED_DATA", err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "content",
+                                    atlas_safe(&ds->safe, atlas_buf_cstr(&s->content)), err);
+        }
+    }
+    if (st == ATLAS_OK && !(s->found && s->stored)) {
+        const char *why =
+            !s->found ? "the attempt produced no artifact of this name"
+                      : "the artifact exceeded the bound one completion may carry, so its bytes "
+                        "stayed in the worker workspace and are not readable here";
+        st = atlas_json_key_str(ds->j, "unavailable_reason", why, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_obj_end(ds->j, err);
+    }
+    return st;
+}
+
+static atlas_status method_remote_result(dispatch_state *ds, const atlas_ipc_request *req,
+                                         atlas_err *err) {
+    atlas_status st = require_remote_submitter(ds, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    const char *uid = NULL, *token = NULL;
+    if (!atlas_ipc_param_str(req, "job", &uid) || uid == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "which job?");
+    }
+    if (!atlas_ipc_param_str(req, "token", &token) || token == NULL) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "\"token\" is required");
+    }
+
+    const atlas_gwpolicy *gw = &ds->ctx->gwpolicy;
+    atlas_buf tok = ATLAS_BUF_INIT;
+    st = atlas_buf_set_str(&tok, token, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+    char key_id[ATLAS_APIKEY_SELECTOR_HEX + 1u];
+    key_id[0] = '\0';
+    st = atlas_orch_remote_verify(ds->db, &tok,
+                                  (const char (*)[ATLAS_APIKEY_SELECTOR_HEX + 1u])
+                                      gw->remote_submit_keys,
+                                  gw->remote_submit_count, key_id, err);
+    atlas_buf_free(&tok);
+    if (st != ATLAS_OK) {
+        return st;
+    }
+
+    atlas_orch_job_view v;
+    atlas_orch_job_view_init(&v);
+    bool found = false;
+    st = atlas_db_orch_job_get(ds->db, uid, &v, &found, err);
+    /* Scope, in the order that leaks least. A job this credential did not
+     * submit and a job whose repository the policy no longer permits both
+     * answer "no such job": a refusal that distinguished them would tell a
+     * caller which jobs exist, and an inventory handed to whoever asked is not
+     * a refusal. */
+    if (st == ATLAS_OK && (!found || strcmp(v.submit_key_id, key_id) != 0 ||
+                           !atlas_orchpolicy_permits_repo(&ds->ctx->orchpolicy, v.repo_name))) {
+        atlas_orch_job_view_free(&v);
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "no such job");
+    }
+    if (st != ATLAS_OK) {
+        atlas_orch_job_view_free(&v);
+        return st;
+    }
+
+    const bool terminal = atlas_orch_state_is_terminal(v.state);
+    st = atlas_json_key_str(ds->j, "job", v.job_uid, err);
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "state", atlas_orch_state_name(v.state), err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "repo", v.repo_name, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "key_id", v.submit_key_id, err);
+    }
+    /* The field a caller branches on. A running job is not a job with an empty
+     * result: a reader must be able to tell "not yet" from "nothing", and one
+     * of those is a reason to ask again. */
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "availability", terminal ? "terminal" : "not_terminal",
+                                err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "attempts", v.attempts_started, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_int(ds->j, "max_attempts", v.max_attempts, err);
+    }
+    if (!terminal) {
+        atlas_orch_job_view_free(&v);
+        return st;
+    }
+    if (st == ATLAS_OK && v.terminal_at[0] != '\0') {
+        st = atlas_json_key_str(ds->j, "terminal_at", v.terminal_at, err);
+    }
+    if (st == ATLAS_OK) {
+        char reason[64];
+        reason[0] = '\0';
+        atlas_err rerr;
+        atlas_err_init(&rerr);
+        if (atlas_db_orch_job_newest_reason(ds->db, v.job_uid, reason, &rerr) == ATLAS_OK &&
+            reason[0] != '\0') {
+            st = atlas_json_key_str(ds->j, "reason", reason, err);
+        }
+    }
+    atlas_orch_job_view_free(&v);
+
+    /* Usage, on the same terms `job.remote_get` reports it, plus the one thing
+     * that method does not say: whether the measurement is complete. A worker
+     * killed at a bound never wrote a final record, so its cost is unknown —
+     * and unknown must not read as zero, which is what a bare absent field
+     * invites a caller to assume. */
+    if (st == ATLAS_OK) {
+        atlas_orch_job_usage u;
+        atlas_err uerr;
+        atlas_err_init(&uerr);
+        if (atlas_db_orch_job_usage(ds->db, uid, &u, &uerr) != ATLAS_OK) {
+            memset(&u, 0, sizeof(u));
+        }
+        st = atlas_json_key(ds->j, "usage", err);
+        if (st == ATLAS_OK) {
+            st = atlas_json_obj_begin(ds->j, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_bool(ds->j, "present", u.present, err);
+        }
+        const bool complete = u.present && u.model[0] != '\0' && u.has_cost && u.has_turns;
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_bool(ds->j, "complete", complete, err);
+        }
+        if (st == ATLAS_OK && u.model[0] != '\0') {
+            st = atlas_json_key_str(ds->j, "model", u.model, err);
+        }
+        if (st == ATLAS_OK && u.has_cost) {
+            st = atlas_json_key_int(ds->j, "cost_micro_usd", u.cost_micro_usd, err);
+        }
+        if (st == ATLAS_OK && u.has_turns) {
+            st = atlas_json_key_int(ds->j, "turns", u.turns, err);
+        }
+        if (st == ATLAS_OK && !complete) {
+            /* Says what is known and stops there. Atlas records a usage row for
+             * every completion and fills it from the final record of the
+             * worker's stream; a row with nothing in it means that record never
+             * arrived, and the two ways that happens — a worker stopped at a
+             * bound before it wrote one, and a driver that streams no
+             * measurement at all — are not distinguishable from the row.
+             * Naming one of them here would be inventing a cause. What must be
+             * unambiguous is the part that matters to a reader: unknown is not
+             * zero. */
+            st = atlas_json_key_str(
+                ds->j, "incomplete_reason",
+                u.present ? "the attempt's completion carried no final measurement, so what it "
+                            "cost is unknown; unknown is not zero"
+                          : "no usage row exists for this job",
+                err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_obj_end(ds->j, err);
+        }
+    }
+
+    /* The three artifacts, by name and by nothing else. */
+    result_slot slots[3];
+    memset(slots, 0, sizeof(slots));
+    slots[0].name = ATLAS_ORCH_RESULT_TEXT_NAME;
+    slots[1].name = ATLAS_ORCH_RESULT_PATCH_NAME;
+    slots[2].name = ATLAS_ORCH_RESULT_GATES_NAME;
+    for (size_t i = 0; i < 3; i++) {
+        atlas_buf_init(&slots[i].content);
+    }
+    if (st == ATLAS_OK) {
+        result_ctx rc = {slots, 3};
+        int64_t n = 0;
+        atlas_err aerr;
+        atlas_err_init(&aerr);
+        /* A failure to read the artifacts is not a failure of the method: the
+         * state, the reason and the usage are already true and useful, and each
+         * slot reports its own absence. */
+        (void)atlas_db_orch_artifacts(ds->db, uid, 0, true, take_result_artifact, &rc, &n, &aerr);
+    }
+    static const char *const KEYS[3] = {"final_text", "patch", "validations"};
+    for (size_t i = 0; st == ATLAS_OK && i < 3; i++) {
+        st = emit_result_slot(ds, &slots[i], KEYS[i], err);
+    }
+    for (size_t i = 0; i < 3; i++) {
+        atlas_buf_free(&slots[i].content);
+    }
+    return st;
+}
+
 /* --- job.remote_list ------------------------------------------------------- */
 
 static atlas_status method_remote_list(dispatch_state *ds, const atlas_ipc_request *req,
@@ -710,6 +1029,7 @@ static atlas_status method_remote_cancel(dispatch_state *ds, const atlas_ipc_req
 static const atlas_method_entry REMOTE_SUBMIT_METHODS[] = {
     {"job.remote_submit", method_remote_submit},
     {"job.remote_get", method_remote_get},
+    {"job.remote_result", method_remote_result},
     {"job.remote_list", method_remote_list},
     {"job.remote_cancel", method_remote_cancel},
 };

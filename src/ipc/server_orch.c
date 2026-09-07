@@ -2144,7 +2144,9 @@ static atlas_status method_dispatch_complete(dispatch_state *ds, const atlas_ipc
                 ATLAS_ORCH_EXIT_OK,        ATLAS_ORCH_EXIT_NONZERO,
                 ATLAS_ORCH_EXIT_SIGNALLED, ATLAS_ORCH_EXIT_TIMEOUT,
                 ATLAS_ORCH_EXIT_CANCELLED, ATLAS_ORCH_EXIT_SPAWN_FAILED,
-                ATLAS_ORCH_EXIT_MALFORMED_RESULT};
+                ATLAS_ORCH_EXIT_MALFORMED_RESULT,
+                /* A14R. The worker stopped at the dollar bound Atlas gave it. */
+                ATLAS_ORCH_EXIT_BUDGET_EXHAUSTED};
             for (size_t i = 0; i < sizeof KINDS / sizeof KINDS[0]; i++) {
                 if (strcmp(kind, atlas_orch_exit_kind_name(KINDS[i])) == 0) {
                     op->exit_kind = KINDS[i];
@@ -2166,7 +2168,8 @@ static atlas_status method_dispatch_complete(dispatch_state *ds, const atlas_ipc
         if (!op->success && atlas_ipc_param_str(req, "reason", &why) && why != NULL) {
             static const atlas_orch_reason REASONS[] = {ATLAS_ORCH_REASON_VALIDATION_FAILED,
                                                         ATLAS_ORCH_REASON_POLICY_REFUSED,
-                                                        ATLAS_ORCH_REASON_WALL_TIMEOUT};
+                                                        ATLAS_ORCH_REASON_WALL_TIMEOUT,
+                                                        ATLAS_ORCH_REASON_BUDGET_EXHAUSTED};
             for (size_t i = 0; i < sizeof REASONS / sizeof REASONS[0]; i++) {
                 if (strcmp(why, atlas_orch_reason_name(REASONS[i])) == 0) {
                     op->failure_reason = REASONS[i];

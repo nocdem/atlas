@@ -45,8 +45,17 @@
 #define ATLAS_DRIVER_VERSION_MAX 128u
 
 /* The size an argument vector for the Claude Code CLI has to have room for:
- * every fixed flag, the optional model pair, the task, and the NULL. */
-#define ATLAS_DRIVER_CLAUDE_ARGV_MAX 10u
+ * every fixed flag, the optional model pair, the optional budget pair, the
+ * task, and the NULL. */
+#define ATLAS_DRIVER_CLAUDE_ARGV_MAX 12u
+
+/* A14R. `--max-budget-usd` takes a decimal dollar amount. The widest value
+ * `ATLAS_ORCH_MAX_COST_CENTS` can produce is "10000.00", but the buffer is
+ * sized for the widest an `int64_t` can produce — 19 digits, a point, two more
+ * and a terminator — because the range check that keeps it small is a runtime
+ * one the compiler cannot see, and a bound only a human can verify is the kind
+ * that stops being true. */
+#define ATLAS_DRIVER_BUDGET_ARG_MAX 24u
 
 /* A12.0. What a driver is *for*, which is not the same question as where it
  * works or whether it needs a model.
@@ -116,6 +125,26 @@ typedef struct atlas_driver_req {
      * kindly. The value is a checked policy token, and it reaches the child as
      * its own argv element. */
     const char *model;
+    /* A14R. The dollar bound the worker's own CLI enforces on itself, in whole
+     * cents, or zero for "no bound named".
+     *
+     * It comes from the same place `model` does and for the same reason: the
+     * root-owned orchestration policy, resolved by the caller, never from a
+     * submission. A worker that could choose its own budget could choose an
+     * unbounded one.
+     *
+     * Cents rather than dollars because the value is compared, stored and
+     * printed, and a float that is compared is a float that eventually compares
+     * wrong. The flag it becomes takes dollars, so the conversion happens once,
+     * where the vector is built.
+     *
+     * **This is a bound the CLI applies to itself and Atlas cannot verify.**
+     * Atlas passes the flag and reads what the final record says happened; it
+     * has no way to stop a worker that ignores it. What Atlas does enforce is
+     * the wall clock, which is a bound on the same runaway by a different
+     * measure. Stated rather than implied, because "cost limit" reads as a
+     * guarantee and this is a request the worker is trusted to honour. */
+    int64_t max_cost_cents;
     int64_t wall_timeout_ms;
     int64_t idle_timeout_ms;
     int64_t max_output_bytes;
@@ -236,8 +265,16 @@ bool atlas_driver_progress_line_is_event(const char *line, size_t len);
  * NULL when there is room for it — when it cannot build a complete vector: no
  * executable, no task, or a capacity below what this vector needs. A short
  * vector is refused rather than truncated, because a truncated one would run a
- * worker with no task. */
+ * worker with no task.
+ *
+ * A14R adds `--max-budget-usd`, on the same terms as `--model`: present only
+ * when the policy named a bound, absent entirely otherwise so a machine that
+ * configured none runs exactly the command that shipped before. `budget_buf` is
+ * the caller's storage for the formatted amount — the function stays pure and
+ * the vector keeps borrowing rather than owning, which is what lets a test read
+ * the real thing instead of a restatement of it. */
 size_t atlas_driver_claude_build_argv(const atlas_driver_req *req, const char *exe,
+                                      char budget_buf[ATLAS_DRIVER_BUDGET_ARG_MAX],
                                       const char **argv_out, size_t cap);
 
 const atlas_driver *atlas_driver_find(const char *name);

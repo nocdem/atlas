@@ -202,6 +202,7 @@ const char *atlas_orch_reason_name(atlas_orch_reason r) {
     case ATLAS_ORCH_REASON_RECOVERY_AMBIGUOUS: return "RECOVERY_AMBIGUOUS";
     case ATLAS_ORCH_REASON_POLICY_REFUSED: return "POLICY_REFUSED";
     case ATLAS_ORCH_REASON_ENVELOPE_INVALID: return "ENVELOPE_INVALID";
+    case ATLAS_ORCH_REASON_BUDGET_EXHAUSTED: return "BUDGET_EXHAUSTED";
     }
     return "UNKNOWN";
 }
@@ -226,6 +227,7 @@ const char *atlas_orch_exit_kind_name(atlas_orch_exit_kind k) {
     case ATLAS_ORCH_EXIT_CANCELLED: return "CANCELLED";
     case ATLAS_ORCH_EXIT_SPAWN_FAILED: return "SPAWN_FAILED";
     case ATLAS_ORCH_EXIT_MALFORMED_RESULT: return "MALFORMED_RESULT";
+    case ATLAS_ORCH_EXIT_BUDGET_EXHAUSTED: return "BUDGET_EXHAUSTED";
     }
     return "UNKNOWN";
 }

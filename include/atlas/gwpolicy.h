@@ -80,6 +80,11 @@
  * simultaneous remote submissions or this many per calendar day. */
 #define ATLAS_GWPOLICY_SUBMIT_MAX_ACTIVE_CEILING 8
 #define ATLAS_GWPOLICY_SUBMIT_MAX_PER_DAY_CEILING 64
+/* A14R. The absolute ceiling on the machine-wide bound. Above the per-credential
+ * ceiling because it is a bound on the sum of several credentials, and still a
+ * ceiling because a policy that may name any number is not a policy Atlas
+ * bounded. */
+#define ATLAS_GWPOLICY_SUBMIT_MAX_ACTIVE_TOTAL_CEILING 32
 #define ATLAS_GWPOLICY_ORIGIN_MAX 128u
 #define ATLAS_GWPOLICY_ADDR_MAX 64u
 #define ATLAS_GWPOLICY_URL_MAX 256u
@@ -277,8 +282,33 @@ typedef struct atlas_gwpolicy {
     char remote_submit_gates[ATLAS_ORCH_MAX_VALIDATIONS][ATLAS_GWPOLICY_GATE_LINE_MAX];
     size_t remote_submit_gate_count;
     long long remote_submit_max_attempts;
+    /* Per credential. Two credentials at 2 each is four jobs, not two, which is
+     * what `remote_submit_max_active_total` exists to bound. */
     long long remote_submit_max_active;
+    /* A14R. Zero means **no daily bound**, and it is the one value in this
+     * struct where zero is a decision rather than an absence.
+     *
+     * A14 read 1..64 and made 0 MALFORMED, so "no daily limit" could not be
+     * expressed and an operator who wanted one had to write the ceiling and
+     * call it unlimited — a documented bound that is not the implemented bound,
+     * one layer up. Zero is now accepted and enforced as "do not count", and
+     * every other out-of-range value stays MALFORMED: the key is still
+     * all-or-none with the other six, so it cannot be reached by leaving a line
+     * out, only by writing `0` on purpose. */
     long long remote_submit_max_per_day;
+    /* A14R. The ceiling on remote jobs active at once across **every**
+     * credential, or zero when the policy names none.
+     *
+     * The per-credential bound answers "how much may this key have in flight";
+     * this answers "how much may this machine be doing for remote callers at
+     * all", and no combination of credentials can exceed it. It is checked in
+     * the same write transaction as the per-credential one and against the same
+     * definition of active, so the two cannot disagree about what counts.
+     *
+     * Zero is "unbounded by this key" rather than "no remote jobs": a bound of
+     * zero would refuse every submission, which is what leaving the submit keys
+     * out already does, more clearly. */
+    long long remote_submit_max_active_total;
     /* True only when the policy carries `operator_accepts_cleartext_submission = yes`.
      * Never a default; refused under REVERSE_PROXY; refused without a submit key; and
      * never implied by `cleartext_disposal_accepted`, for the reason in §The decision

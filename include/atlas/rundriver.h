@@ -134,6 +134,9 @@ typedef struct atlas_rundriver_opts {
      * empty is the ordinary state: no flag is passed and the worker runs on the
      * account's own default, which is every run that predates this season. */
     atlas_driver_models models;
+    /* A14R. The dollar bound each model attempt is given, in whole cents, from
+     * the root-owned policy. Zero passes no flag at all. */
+    int64_t max_cost_cents;
     /* Stop after this many claimed tasks. Zero means "until the run settles",
      * which is what the command does; a positive value is how a test drives
      * exactly one task without racing anything. The run's own worker-start

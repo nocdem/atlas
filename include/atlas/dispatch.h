@@ -49,6 +49,9 @@ typedef struct atlas_dispatch_opts {
      * nothing else — `atlas_driver_model_for`. Both empty is the ordinary state
      * and passes no flag. */
     atlas_driver_models models;
+    /* A14R. The dollar bound each model attempt is given, in whole cents, from
+     * the root-owned policy. Zero passes no flag at all. */
+    int64_t max_cost_cents;
     /* Comma-separated driver names this dispatcher will run. NULL means any.
      * Sent with each lease request and matched against the job's stored
      * driver. */

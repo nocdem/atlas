@@ -110,6 +110,10 @@ typedef struct atlas_orchpolicy {
     long long max_wall_timeout_ms;
     long long max_idle_timeout_ms;
     long long max_attempts;
+    /* A14R. The dollar bound one attempt may spend, in whole cents; zero means
+     * no bound is named and no flag is passed. Cents rather than dollars
+     * because the value is compared, stored and printed. */
+    long long max_cost_cents;
     long long max_output_bytes;
     long long max_artifact_bytes;
     long long max_artifact_count;

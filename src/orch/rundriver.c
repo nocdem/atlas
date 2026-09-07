@@ -963,6 +963,11 @@ static atlas_orch_reason reason_for(atlas_orch_exit_kind k) {
     case ATLAS_ORCH_EXIT_TIMEOUT: return ATLAS_ORCH_REASON_WALL_TIMEOUT;
     case ATLAS_ORCH_EXIT_CANCELLED: return ATLAS_ORCH_REASON_CANCEL_REQUESTED;
     case ATLAS_ORCH_EXIT_MALFORMED_RESULT: return ATLAS_ORCH_REASON_ENVELOPE_INVALID;
+    /* A14R. The run driver reaches the write point in its own process, so this
+     * is where its budget refusal becomes the reason the ledger records — the
+     * same value the dispatcher sends over the socket, arrived at by the same
+     * classification in `claude_exec`. */
+    case ATLAS_ORCH_EXIT_BUDGET_EXHAUSTED: return ATLAS_ORCH_REASON_BUDGET_EXHAUSTED;
     case ATLAS_ORCH_EXIT_OK:
     case ATLAS_ORCH_EXIT_NONZERO:
     case ATLAS_ORCH_EXIT_SIGNALLED:
@@ -1257,6 +1262,7 @@ static atlas_status drive_one(const atlas_rundriver_opts *o, const atlas_orch_ru
              * driver's role and the root-owned policy — never by the task, the
              * chain, or anything the previous worker said. */
             req.model = atlas_driver_model_for(d, &o->models);
+            req.max_cost_cents = o->max_cost_cents;
             /* Polled while the child runs: it renews the lease and is how the
              * child learns of a cancellation. Without it a worker that takes
              * longer than one lease loses the attempt underneath itself. */

@@ -912,7 +912,21 @@ is not written down is one somebody deletes.** Both halves are load-bearing.
 - **`remote_dispose_key` and `remote_submit_key` may never name the same id.** One credential, one power.
 - **`jobs:submit` is in SCOPES[] with `grantable = false`**, derived for named keys, refused at `atlas api-key create --scope jobs:submit`.
 - **The two unattended and deferred shapes run as `model_dispatcher_uid`.** On this deployment that is the operator's own account. State what is true.
-- **No new thread, process, timer or background loop beyond the worker; no MCP tool on the stdio adapter; no new decision method; no new authority verb.** Four `job.remote_*` methods, four gateway routes, four MCP tools with `remote_only = true`, one migration.
+- **No new thread, process, timer or background loop beyond the worker; no MCP tool on the stdio adapter; no new decision method; no new authority verb.** Four `job.remote_*` methods, four gateway routes, four MCP tools with `remote_only = true`, one migration. **A14R makes it five of each and adds no migration** — see below.
+
+### A14R — the result a steward can read
+
+- **A GUARANTEE WHOSE ESCAPE HATCH IS NOT IMPLEMENTED IS NOT A NARROWER CHANNEL.** A14's Decision 7 sent an operator to `atlas job artifact`, which is not a command; and for an executor driver the bytes were destroyed with the workspace anyway. A steward could start work and never read it. **Decision 7 is revised, in `docs/remote-submission.md` as Decision 7R.**
+- **Three names, composed by Atlas, and no parameter that selects a file.** `result.txt`, `changes.patch`, `validations.txt` — constants in `atlas/orch.h`, each written *after* the driver exits so a worker cannot forge one. `job.remote_result` takes only the job, so "a caller may not name an artifact" is a property of the signature.
+- **`job.remote_apply`, `job.remote_artifact`, `job.remote_log` and `job.remote_run` are still forbidden**, still scanned for in `tests/test_orch_rpc.c`. A worker's `logs/stdout.log` is reachable under no name. The method writes no row, starts no process and applies nothing.
+- **The inline budget is the completion's, not the artifact's.** 320 KiB raw against a 1 MiB IPC frame, because hex doubles every byte and a completion that does not fit loses a finished worker's outcome. An artifact over the budget is described, never truncated.
+- **The dispatcher never sent `usage`, and the daemon had always accepted it.** Both halves existed since A10.0 and nothing joined them, so every dispatched job wrote an `orch_usage` row with an empty model and a NULL cost. Fixed at `build_complete`. **An absent measurement is `complete: false` with a reason, never a zero.**
+- **`remote_submit_max_per_day = 0` is unlimited and is the one zero in the submission block that is a decision.** It stays in the all-or-none set, so unlimited can only be written on purpose, never reached by omitting a line. Every other out-of-range value is still MALFORMED.
+- **`remote_submit_max_active_total` bounds every credential together** and is checked in the same transaction, against the same terminal predicate, as the per-credential bound. Absent is unbounded; `0` is refused rather than read as unbounded.
+- **`max_cost_usd` lives in the orchestration policy, not the gateway's, because the dispatcher enforces it and never reads the gateway's.** It becomes the CLI's own `--max-budget-usd`. **It is a bound the worker applies to itself and Atlas cannot verify** — the wall clock is the one Atlas enforces. Say which is which.
+- **The wall ceiling is three hours, and that is a fail-safe, not an operating bound.** Raised from one after four of six gateway jobs on 2026-09-06 ended TIMED_OUT at the policy's 15 minutes with no patch, no gate output and no usage record.
+- **`BUDGET_EXHAUSTED` ends the task and spawns no follow-up.** Retrying spends the same money to reach the same place; a narrower task answers work that came out wrong, not work that did not finish.
+- **No migration, no new thread, process, timer or background loop, no new scope, no new authority verb.** One new RPC method, one gateway route, one MCP tool with `remote_only = true` and `writes = false`.
 
 ### A16 — browser disposal
 

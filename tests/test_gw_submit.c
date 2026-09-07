@@ -27,6 +27,7 @@
 #include "atlas/apikey.h"
 #include "atlas/atlas.h"
 #include "atlas/datadir.h"
+#include "atlas/dispatch.h"
 #include "atlas/gateway.h"
 #include "atlas/gw.h"
 #include "atlas/gwpolicy.h"
@@ -1083,6 +1084,25 @@ static void test_d_mcp_tool_calls(void) {
                "tools/list did not include atlas_job_list: %s", body_of(&resp));
     T_CHECK_MSG(strstr(body_of(&resp), "atlas_job_cancel") != NULL,
                "tools/list did not include atlas_job_cancel: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "atlas_job_result") != NULL,
+               "tools/list did not include atlas_job_result: %s", body_of(&resp));
+    /* A14R. The annotations a client reads to decide whether a call needs
+     * approval must say what is true of each tool. `atlas_job_result` reads and
+     * `atlas_job_submit` starts a worker, so exactly one of them may be
+     * readOnly — marking the submit tool read-only to skip an approval prompt
+     * is the specific mistake this asserts against. */
+    {
+        const char *r = strstr(body_of(&resp), "\"name\":\"atlas_job_result\"");
+        const char *s = strstr(body_of(&resp), "\"name\":\"atlas_job_submit\"");
+        T_REQUIRE_MSG(r != NULL && s != NULL, "both job tools must be listed");
+        const char *r_ro = strstr(r, "\"readOnlyHint\":");
+        const char *s_ro = strstr(s, "\"readOnlyHint\":");
+        T_REQUIRE(r_ro != NULL && s_ro != NULL);
+        T_CHECK_MSG(strncmp(r_ro, "\"readOnlyHint\":true", 19) == 0,
+                    "atlas_job_result is not marked read-only");
+        T_CHECK_MSG(strncmp(s_ro, "\"readOnlyHint\":false", 20) == 0,
+                    "atlas_job_submit is marked read-only, which would skip an approval");
+    }
     {
         /* Mirror test_decision_mcp.c's FORBIDDEN_PROPS check. */
         static const char *const FORBIDDEN_PROPS[] = {
@@ -1278,6 +1298,295 @@ static void test_d_mcp_tool_calls(void) {
 
 /* --- test registry --------------------------------------------------------- */
 
+/* --- A14R: job.remote_result ------------------------------------------------
+ *
+ * The whole chain, over the real socket and the real HTTP surface: submit
+ * through the gateway, carry the attempt with the shipped dispatcher, and read
+ * the result back through the route a steward reaches.
+ *
+ * Substituted: the driver is `fake`, and the dispatcher runs in this process
+ * rather than as a service. Both are the substitutions `test_plan_e2e.c` makes
+ * and for its reasons — `atlas_dispatch_run_one` provisions the same workspace,
+ * runs the same driver interface, reports the same completion over the same
+ * socket. What is *not* substituted is everything this season added: the
+ * completion's inline manifest and its byte budget, the storage, the scope
+ * check, the artifact selection and the emitted document.
+ */
+static void test_e_result_of_a_dispatched_job(void) {
+    env e;
+    env_open(&e);
+    atlas_err err;
+    atlas_err_init(&err);
+
+    char worker_root[4096];
+    (void)snprintf(worker_root, sizeof worker_root, "%s/worker", fx_data_dir(&e.fx));
+    T_REQUIRE(mkdir(worker_root, S_IRWXU) == 0 || errno == EEXIST);
+
+    char gw_policy[2048];
+    (void)snprintf(gw_policy, sizeof(gw_policy),
+                   "enabled = yes\ngateway_uid = %ld\nremote_mcp = yes\n"
+                   "web_gui = yes\nlisten_addr = 127.0.0.1\ntls_mode = REVERSE_PROXY\n"
+                   "remote_submit_key = %s\nremote_submit_key = %s\n"
+                   "remote_submit_driver = fake\nremote_submit_mode = patch\n"
+                   "remote_submit_max_attempts = 1\nremote_submit_max_active = 8\n"
+                   "remote_submit_max_per_day = 0\nremote_submit_gate = true\n",
+                   (long)getuid(), e.submit_id, e.second_id);
+
+    /* The dispatcher is this process, so the orchestration policy has to name
+     * this uid. `submitter_uid` stays a uid nobody here holds: this test drives
+     * the gateway's credential path, never the local submitter's. */
+    char orch_policy[5120];
+    (void)snprintf(orch_policy, sizeof(orch_policy),
+                   "dispatcher_uid = %ld\nsubmitter_uid = 2\n"
+                   "repo = proj\ndriver = fake\nmode = patch\nworker_root = %s\n",
+                   (long)getuid(), worker_root);
+
+    const char *gw_path = write_policy_file(&e, "gw.conf", gw_policy);
+    const char *orch_path = write_policy_file(&e, "orch.conf", orch_policy);
+
+    fx_daemon d;
+    fx_daemon_init(&d);
+    T_REQUIRE(gwd_start(&e, gw_path, orch_path, &d, &err) == ATLAS_OK);
+    T_OK(fx_daemon_wait_ready(&d, 15000, &err), &err);
+
+    atlas_gateway *g = NULL;
+    open_http_gateway(gw_policy, &d, &g);
+
+    char submit_bearer[ATLAS_APIKEY_TOKEN_MAX + 8u];
+    bearer_of(e.submit_token, submit_bearer, sizeof submit_bearer);
+    char second_bearer[ATLAS_APIKEY_TOKEN_MAX + 8u];
+    bearer_of(e.second_token, second_bearer, sizeof second_bearer);
+
+    atlas_buf resp = ATLAS_BUF_INIT;
+    post_form(g, "/api/v1/job/submit", submit_bearer, "repo=proj&task=make+a+change&key=r1",
+              &resp);
+    T_REQUIRE_MSG(status_of(&resp) == 200, "submit did not answer 200: %d %s", status_of(&resp),
+                  body_of(&resp));
+    atlas_buf job_uid = ATLAS_BUF_INIT;
+    T_REQUIRE_MSG(get_field(&resp, "job", &job_uid), "no job field: %s", body_of(&resp));
+
+    char form[256];
+    (void)snprintf(form, sizeof form, "job=%s", atlas_buf_cstr(&job_uid));
+
+    /* (e1) A queued job is `not_terminal`, and says so rather than answering
+     * with empty fields. A reader must be able to tell "not yet" from
+     * "nothing", because one of them is a reason to ask again. */
+    atlas_buf_reset(&resp);
+    post_form(g, "/api/v1/job/result", submit_bearer, form, &resp);
+    T_CHECK_MSG(status_of(&resp) == 200, "result on a queued job: %d %s", status_of(&resp),
+                body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "\"availability\":\"not_terminal\"") != NULL,
+                "a queued job did not answer not_terminal: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "\"patch\"") == NULL,
+                "a non-terminal job emitted artifact fields: %s", body_of(&resp));
+
+    /* (e2) Another credential named by the same policy cannot read it. The
+     * refusal says "no such job" and not "forbidden": a refusal that
+     * distinguished them would tell a caller which jobs exist. */
+    atlas_buf_reset(&resp);
+    post_form(g, "/api/v1/job/result", second_bearer, form, &resp);
+    T_CHECK_MSG(status_of(&resp) != 200, "a second credential read another key's result: %s",
+                body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "no such job") != NULL,
+                "cross-credential refusal did not say \"no such job\": %s", body_of(&resp));
+
+    /* Carry the attempt with the shipped dispatcher. */
+    {
+        atlas_dispatch_opts o;
+        memset(&o, 0, sizeof(o));
+        o.socket_path = atlas_buf_cstr(&d.socket);
+        o.worker_root = worker_root;
+        o.dispatcher_id = "atlas-gw-result-test";
+        o.drivers = "fake";
+        o.heartbeat_ms = ATLAS_ORCH_LEASE_MS / 4;
+        bool ran = false;
+        T_OK(atlas_dispatch_run_one(&o, atlas_buf_cstr(&job_uid), &ran, &err), &err);
+        T_REQUIRE_MSG(ran, "the dispatcher was not granted the job it named");
+    }
+
+    /* (e3) The successful attempt's workspace is gone -- which is the whole
+     * reason the bytes had to travel. Asserted rather than assumed, because if
+     * the dispatcher ever stopped removing it the next checks would pass for
+     * the wrong reason. */
+    {
+        char attempt_dir[4600];
+        (void)snprintf(attempt_dir, sizeof attempt_dir, "%s/jobs/%s/1/artifacts", worker_root,
+                       atlas_buf_cstr(&job_uid));
+        struct stat sb;
+        T_CHECK_MSG(stat(attempt_dir, &sb) != 0,
+                    "the attempt's artifacts directory still exists at %s", attempt_dir);
+    }
+
+    /* (e4) The result, read back through the route. */
+    atlas_buf_reset(&resp);
+    post_form(g, "/api/v1/job/result", submit_bearer, form, &resp);
+    T_REQUIRE_MSG(status_of(&resp) == 200, "result did not answer 200: %d %s", status_of(&resp),
+                  body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "\"availability\":\"terminal\"") != NULL,
+                "a completed job is not terminal: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "\"state\":\"SUCCEEDED\"") != NULL,
+                "the dispatched job did not succeed: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "the fake driver has nothing to report") != NULL,
+                "the worker's answer did not survive the workspace: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "ATLAS_FAKE_DRIVER.txt") != NULL,
+                "the patch did not survive the workspace: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "atlas-validations-1") != NULL,
+                "the gate summary did not survive the workspace: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "passed=yes") != NULL,
+                "the gate summary does not carry its verdict: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "\"provenance\":\"UNTRUSTED_DATA\"") != NULL,
+                "returned bytes are not labelled UNTRUSTED_DATA: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "\"encoding\":\"atlas-safe-1\"") != NULL,
+                "returned bytes are not safe-encoded: %s", body_of(&resp));
+
+    /* (e5) Three names travelled, and not every name. `report.txt` is an
+     * artifact of the same attempt, stored in the same table, and it is not on
+     * the list -- so this is the difference between "A14R carried the three
+     * files a reviewer needs" and "A14R opened artifact access". */
+    T_CHECK_MSG(strstr(body_of(&resp), "report.txt") == NULL,
+                "an artifact outside the three names was returned: %s", body_of(&resp));
+
+    /* (e6) A worker's stdout log is not reachable here under any name. */
+    T_CHECK_MSG(strstr(body_of(&resp), "fake driver ran for job") == NULL,
+                "a worker log leaked into the result: %s", body_of(&resp));
+
+    /* (e7) Usage says whether it is complete rather than leaving a reader to
+     * read an absent cost as zero. The fake driver streams nothing, so this is
+     * the incomplete case, stated. */
+    T_CHECK_MSG(strstr(body_of(&resp), "\"complete\":false") != NULL,
+                "a job with no measurement did not say so: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "\"incomplete_reason\"") != NULL,
+                "an incomplete measurement carried no reason: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "\"cost_micro_usd\"") == NULL,
+                "an unmeasured cost was reported as a number: %s", body_of(&resp));
+
+    /* (e8) Nothing was applied. The registered repository is untouched: the
+     * worker's change lives in a patch and in nothing else. */
+    {
+        char applied[4096];
+        (void)snprintf(applied, sizeof applied, "%s/ATLAS_FAKE_DRIVER.txt", fx_repo(&e.fx));
+        struct stat sb;
+        T_CHECK_MSG(stat(applied, &sb) != 0,
+                    "reading a result applied the patch to the repository");
+    }
+
+    /* (e9) Durable across a restart of the daemon that accepted it. The rows
+     * are read by a process that did not write them, which is O10's rule for
+     * an accepted record. */
+    fx_daemon_stop(&d, false);
+    fx_daemon_init(&d);
+    T_REQUIRE(gwd_start(&e, gw_path, orch_path, &d, &err) == ATLAS_OK);
+    T_OK(fx_daemon_wait_ready(&d, 15000, &err), &err);
+    atlas_gateway_close(g);
+    g = NULL;
+    open_http_gateway(gw_policy, &d, &g);
+
+    atlas_buf_reset(&resp);
+    post_form(g, "/api/v1/job/result", submit_bearer, form, &resp);
+    T_CHECK_MSG(status_of(&resp) == 200, "result after restart: %d %s", status_of(&resp),
+                body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "the fake driver has nothing to report") != NULL,
+                "the answer did not survive a daemon restart: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "ATLAS_FAKE_DRIVER.txt") != NULL,
+                "the patch did not survive a daemon restart: %s", body_of(&resp));
+
+    atlas_buf_free(&job_uid);
+    atlas_buf_free(&resp);
+    atlas_gateway_close(g);
+    fx_daemon_stop(&d, false);
+    env_close(&e);
+}
+
+/* --- A14R: the two budget changes, enforced rather than only parsed ---------
+ *
+ * `remote_submit_max_per_day = 0` is unlimited, and `max_active_total` bounds
+ * every credential together. Both are checked in the write transaction, so both
+ * are asserted through the surface a caller reaches rather than against the
+ * parser -- a bound that parses and is never consulted is exactly the failure
+ * this season is named after.
+ */
+static void test_f_the_machine_wide_bound_and_the_unlimited_day(void) {
+    env e;
+    env_open(&e);
+    atlas_err err;
+    atlas_err_init(&err);
+
+    /* Two credentials, each allowed 8 active jobs of its own, and a machine-wide
+     * bound of 3. Per-credential arithmetic would permit sixteen; the bound
+     * under test is the only thing that stops the fourth. The daily bound is 0,
+     * so nothing here is refused for being the seventh of a day either -- which
+     * is what makes the refusal below attributable to one line. */
+    char gw_policy[2048];
+    (void)snprintf(gw_policy, sizeof(gw_policy),
+                   "enabled = yes\ngateway_uid = %ld\nremote_mcp = yes\n"
+                   "web_gui = yes\nlisten_addr = 127.0.0.1\ntls_mode = REVERSE_PROXY\n"
+                   "remote_submit_key = %s\nremote_submit_key = %s\n"
+                   "remote_submit_driver = fake\nremote_submit_mode = patch\n"
+                   "remote_submit_max_attempts = 1\nremote_submit_max_active = 8\n"
+                   "remote_submit_max_per_day = 0\nremote_submit_gate = true\n"
+                   "remote_submit_max_active_total = 3\n",
+                   (long)getuid(), e.submit_id, e.second_id);
+
+    char orch_policy[1024];
+    (void)snprintf(orch_policy, sizeof(orch_policy),
+                   "dispatcher_uid = 1\nsubmitter_uid = 2\n"
+                   "repo = proj\ndriver = fake\nmode = patch\nworker_root = /tmp\n");
+
+    const char *gw_path = write_policy_file(&e, "gw.conf", gw_policy);
+    const char *orch_path = write_policy_file(&e, "orch.conf", orch_policy);
+
+    fx_daemon d;
+    fx_daemon_init(&d);
+    T_REQUIRE(gwd_start(&e, gw_path, orch_path, &d, &err) == ATLAS_OK);
+    T_OK(fx_daemon_wait_ready(&d, 15000, &err), &err);
+
+    atlas_gateway *g = NULL;
+    open_http_gateway(gw_policy, &d, &g);
+
+    char submit_bearer[ATLAS_APIKEY_TOKEN_MAX + 8u];
+    bearer_of(e.submit_token, submit_bearer, sizeof submit_bearer);
+    char second_bearer[ATLAS_APIKEY_TOKEN_MAX + 8u];
+    bearer_of(e.second_token, second_bearer, sizeof second_bearer);
+
+    atlas_buf resp = ATLAS_BUF_INIT;
+
+    /* Two on the first credential, one on the second: three active, from two
+     * keys, under a per-credential bound neither has come close to. */
+    static const char *const FIRST[] = {"repo=proj&task=one&key=t1", "repo=proj&task=two&key=t2"};
+    for (size_t i = 0; i < 2; i++) {
+        atlas_buf_reset(&resp);
+        post_form(g, "/api/v1/job/submit", submit_bearer, FIRST[i], &resp);
+        T_REQUIRE_MSG(status_of(&resp) == 200, "submit %zu did not answer 200: %d %s", i,
+                      status_of(&resp), body_of(&resp));
+    }
+    atlas_buf_reset(&resp);
+    post_form(g, "/api/v1/job/submit", second_bearer, "repo=proj&task=three&key=t3", &resp);
+    T_REQUIRE_MSG(status_of(&resp) == 200, "the second credential was refused: %d %s",
+                  status_of(&resp), body_of(&resp));
+
+    /* The fourth is refused, and the sentence names the machine rather than the
+     * caller's own key -- the caller has spent three of its own eight. */
+    atlas_buf_reset(&resp);
+    post_form(g, "/api/v1/job/submit", second_bearer, "repo=proj&task=four&key=t4", &resp);
+    T_CHECK_MSG(status_of(&resp) != 200,
+                "a fourth active remote job was accepted under a total bound of 3: %s",
+                body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "across all credentials") != NULL,
+                "the refusal did not name the machine-wide bound: %s", body_of(&resp));
+
+    /* And the daily bound refused none of them: four submissions in one day
+     * with `max_per_day = 0` produced exactly one refusal, and it was the
+     * machine-wide one. A daily bound still in force would have refused the
+     * first credential's second submission under A14's minimum of 1. */
+    T_CHECK_MSG(strstr(body_of(&resp), "today") == NULL,
+                "an unlimited daily bound still refused a submission: %s", body_of(&resp));
+
+    atlas_buf_free(&resp);
+    atlas_gateway_close(g);
+    fx_daemon_stop(&d, false);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"happy path: submit, large body, /get, /list, /cancel, audit trail",
      test_a_happy_path_and_audit},
@@ -1291,6 +1600,10 @@ static const atlas_test TESTS[] = {
      test_c_auth_me_fields},
     {"MCP: tools/list names the four tools, submit/status/list/cancel, duplicate, SUCCEEDED, schema refusal",
      test_d_mcp_tool_calls},
+    {"A14R: result of a dispatched job -- three names, durable, applied to nothing",
+     test_e_result_of_a_dispatched_job},
+    {"A14R: a machine-wide active bound, and a daily bound of zero that refuses nothing",
+     test_f_the_machine_wide_bound_and_the_unlimited_day},
 };
 
 ATLAS_TEST_MAIN("gw_submit", TESTS)

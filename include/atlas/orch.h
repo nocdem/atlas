@@ -191,7 +191,15 @@ typedef enum atlas_orch_reason {
     ATLAS_ORCH_REASON_ATTEMPTS_EXHAUSTED,
     ATLAS_ORCH_REASON_RECOVERY_AMBIGUOUS,
     ATLAS_ORCH_REASON_POLICY_REFUSED,
-    ATLAS_ORCH_REASON_ENVELOPE_INVALID
+    ATLAS_ORCH_REASON_ENVELOPE_INVALID,
+    /* A14R. The attempt ended because it reached the root-owned dollar bound.
+     *
+     * It ends the task rather than retrying it, for the reason a failed gate
+     * does: another attempt at the same task under the same bound spends the
+     * same money to reach the same place. Unlike a gate failure it produces no
+     * follow-up either — a narrower task is Atlas' answer to work that was
+     * wrong, and this is work that was not finished. */
+    ATLAS_ORCH_REASON_BUDGET_EXHAUSTED
 } atlas_orch_reason;
 
 const char *atlas_orch_reason_name(atlas_orch_reason r);
@@ -227,7 +235,18 @@ typedef enum atlas_orch_exit_kind {
      * Kept distinct from NONZERO on purpose: "Claude exits zero but produces
      * malformed result metadata" is a real failure mode and reading it as
      * success is exactly the mistake. */
-    ATLAS_ORCH_EXIT_MALFORMED_RESULT
+    ATLAS_ORCH_EXIT_MALFORMED_RESULT,
+    /* A14R. The worker stopped because it reached the dollar bound Atlas gave
+     * it on its own command line, and said so in its final record.
+     *
+     * Kept distinct from NONZERO for the reason MALFORMED_RESULT is: a run that
+     * ended on a bound Atlas set is a different fact from one that crashed, and
+     * a reader who cannot tell them apart cannot tell whether raising the bound
+     * would change anything. It is established from the CLI's own final
+     * `"subtype":"error_max_budget_usd"` — a value from a closed vocabulary in
+     * a record Atlas captured, never from prose — and it is a *measurement of a
+     * refusal*, not a claim about the work. */
+    ATLAS_ORCH_EXIT_BUDGET_EXHAUSTED
 } atlas_orch_exit_kind;
 
 const char *atlas_orch_exit_kind_name(atlas_orch_exit_kind k);
@@ -274,9 +293,30 @@ const char *atlas_orch_exit_kind_name(atlas_orch_exit_kind k);
 /* Absolute ceilings. The orchestration policy may lower these and may never
  * raise them: a root-owned file decides how much a submitter may ask for, and
  * this decides how much the policy itself may permit. */
-#define ATLAS_ORCH_MAX_WALL_TIMEOUT_MS 3600000  /* one hour */
+/* A14R. Raised from one hour to three.
+ *
+ * The number is not a guess about how long work takes; it is the point past
+ * which a wedged worker must be stopped whatever it is doing, and it is the
+ * only thing that stops one — a lease is renewable, so a worker that keeps
+ * heartbeating is bounded by this and by nothing else. One hour was measured to
+ * be the wrong side of that line: of six jobs submitted through the gateway on
+ * 2026-09-06, four ended TIMED_OUT at the policy's own 15-minute ceiling with
+ * no patch, no gate output and no usage record, having spent a worker's time
+ * and the operator's money to produce nothing readable.
+ *
+ * Three hours is a fail-safe and is not the operating bound: the orchestration
+ * policy still names what a submission may ask for and may only lower this.
+ * What the raise costs is stated rather than hidden — a genuinely wedged worker
+ * now holds its slot for three hours instead of one, which is why the global
+ * active bound (`remote_submit_max_active_total`) exists in the same season. */
+#define ATLAS_ORCH_MAX_WALL_TIMEOUT_MS 10800000 /* three hours */
 #define ATLAS_ORCH_MAX_IDLE_TIMEOUT_MS 900000   /* fifteen minutes */
 #define ATLAS_ORCH_MAX_ATTEMPTS 5
+/* A14R. The dollar ceiling one attempt may be given, in whole cents. The
+ * orchestration policy may name anything up to this and nothing above it, on
+ * the same terms as every bound beside it. $10,000 is not an expectation; it is
+ * a number above every plausible policy so that the policy is what decides. */
+#define ATLAS_ORCH_MAX_COST_CENTS 1000000
 #define ATLAS_ORCH_MAX_OUTPUT_BYTES (16u * 1024u * 1024u)
 #define ATLAS_ORCH_MAX_ARTIFACT_BYTES (64u * 1024u * 1024u)
 #define ATLAS_ORCH_MAX_ARTIFACT_COUNT 256
@@ -356,6 +396,50 @@ bool atlas_orch_lease_in_grace(int64_t deadline_ms, int64_t at_ms, int64_t conte
 /* Artifact bytes one RPC will return inline. Larger artifacts are described,
  * never streamed through the control socket. */
 #define ATLAS_ORCH_ARTIFACT_INLINE_MAX (256u * 1024u)
+
+/* --- A14R: the three artifacts a remote reader may read ---------------------
+ *
+ * A14 recorded an executor attempt's artifacts by name, size and digest and
+ * carried none of their bytes, because `artifacts_travel_inline` asked the
+ * driver's *role* and only a PLANNER answered yes. The dispatcher then removed
+ * a successful attempt's workspace, as it always does, so the bytes existed
+ * nowhere: measured on this machine, job `j61d9fbb…` ended SUCCEEDED on
+ * 2026-09-06 and its workspace directory holds zero files today.
+ *
+ * These three names, and only these three, now travel inline for every driver.
+ * They are the ones a human reviewing a proposal needs and are each produced by
+ * Atlas rather than named by a worker: `changes.patch` by `atlas_ws_make_patch`
+ * from a content diff of the two trees, `validations.txt` by the dispatcher
+ * from its own gate verdicts, `result.txt` by the driver from the final record
+ * of the stream Atlas captured. A worker that writes a file of one of these
+ * names into `artifacts/` overwrites nothing: Atlas writes each of them after
+ * the driver has exited.
+ *
+ * Everything else keeps A8's behaviour exactly — described, not carried — so
+ * this is a narrow reversal and not a general one, and `job.remote_result`
+ * exposes these three by name rather than any artifact a caller asks for. */
+#define ATLAS_ORCH_RESULT_TEXT_NAME "result.txt"
+#define ATLAS_ORCH_RESULT_PATCH_NAME "changes.patch"
+#define ATLAS_ORCH_RESULT_GATES_NAME "validations.txt"
+
+/* The worker's final answer, bounded. 32 KiB is the first version's number and
+ * it is a display bound, not a safety one: the text is stored, encoded and
+ * rendered, and a reader who is shown a prefix must be told it is one. */
+#define ATLAS_ORCH_RESULT_TEXT_MAX (32u * 1024u)
+
+/* The gate summary Atlas composes. Bounded for the same reason. */
+#define ATLAS_ORCH_RESULT_GATES_MAX (32u * 1024u)
+
+/* The total raw bytes one completion may carry inline, across all three.
+ *
+ * `ATLAS_IPC_MAX_REQUEST_BYTES` is 1 MiB and artifact bytes travel hex-encoded,
+ * so every raw byte costs two on the wire. 320 KiB raw is 640 KiB encoded and
+ * leaves a third of the frame for the manifest, the token and every other field
+ * — and a completion that does not fit is not a truncated artifact, it is a
+ * finished worker whose result never reaches the ledger, so the margin is the
+ * point. An artifact refused by this bound is recorded exactly as an oversized
+ * one already is: name, size and digest, with `content_stored` false. */
+#define ATLAS_ORCH_RESULT_INLINE_TOTAL_MAX (320u * 1024u)
 
 /* --- A11.1: the bound on one run -------------------------------------------
  *

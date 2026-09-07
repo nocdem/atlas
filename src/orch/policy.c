@@ -263,6 +263,31 @@ atlas_orchpolicy_reason atlas_orchpolicy_parse_bytes(const char *buf, size_t tot
             if (!parse_i64(val, vlen, &out->max_attempts)) {
                 BAD();
             }
+        } else if (take_value(line, len, "max_cost_usd", &val, &vlen)) {
+            /* A14R. Whole dollars, 1..ATLAS_ORCH_MAX_COST_CENTS/100, stored as
+             * cents. Refused rather than clamped, and out of range is MALFORMED
+             * like every other value here — the policy is what decides how much
+             * an attempt may spend, so a policy Atlas half-understood would be
+             * one whose author believes they capped something Atlas never read.
+             *
+             * Whole dollars deliberately: the value is written by a person into
+             * a root-owned file and read back into an exact integer, and a
+             * decimal grammar would be a second thing to get right for a
+             * precision nobody asked for. Cents are the internal unit so the
+             * flag the CLI receives is exact.
+             *
+             * This bound is **unlike every other ceiling in this file**: the
+             * others are enforced by Atlas, and this one is a flag handed to a
+             * worker that is trusted to honour it. Atlas cannot stop a worker
+             * that ignores it; the wall clock is the bound that can. Said here
+             * rather than only in the documentation, because a key called
+             * `max_cost_usd` reads as a guarantee. */
+            long long dollars = 0;
+            if (!parse_i64(val, vlen, &dollars) || dollars < 1 ||
+                dollars > ATLAS_ORCH_MAX_COST_CENTS / 100) {
+                BAD();
+            }
+            out->max_cost_cents = dollars * 100;
         } else if (take_value(line, len, "max_output_bytes", &val, &vlen)) {
             if (!parse_i64(val, vlen, &out->max_output_bytes)) {
                 BAD();

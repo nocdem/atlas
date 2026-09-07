@@ -467,6 +467,9 @@ atlas_status atlas_service_dispatcher_run(bool once, FILE *log, atlas_err *err) 
      * attempt. Empty is unset and passes no flag at all. */
     o.models.planner = op.planner_model;
     o.models.executor = op.executor_model;
+    /* A14R. The root-owned dollar bound, carried unchanged to the driver, which
+     * turns it into `--max-budget-usd`. Zero passes no flag. */
+    o.max_cost_cents = op.max_cost_cents;
     o.max_iterations = once ? 1 : 0;
     o.log = log;
     return atlas_dispatch_run(&o, err);
@@ -1051,6 +1054,7 @@ atlas_status atlas_service_run_drive(const atlas_orchpolicy *pol, const char *ru
          * same root-owned policy. */
         ro.models.planner = pol->planner_model;
         ro.models.executor = pol->executor_model;
+        ro.max_cost_cents = pol->max_cost_cents;
         /* A11.5a-R. Where a finished worker's result is made durable before the
          * daemon is asked to accept it. The path comes from the root-owned
          * policy — the same field that already says where this dispatcher owns

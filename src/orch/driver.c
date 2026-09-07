@@ -44,6 +44,7 @@
 #include "atlas/atlas.h"
 #include "atlas/proc.h"
 #include "atlas/rootpath.h"
+#include "atlas/orch_jobresult.h"
 
 /* Where an operator may install a *service* credential for the worker.
  *
@@ -369,6 +370,20 @@ static atlas_status fake_run(const atlas_driver_req *req, atlas_driver_res *res,
     if (st == ATLAS_OK) {
         st = atlas_ws_write(req->ws, "artifacts/report.txt", note.data, note.len, err);
     }
+    /* A14R. The double writes the answer file the real driver writes, for the
+     * reason `fake-plan` holds the planner role: a double that could not stand
+     * where the real one stands would prove nothing about it. Without this the
+     * whole carried-inline path — completion manifest, byte budget, storage,
+     * `job.remote_result` — would be reachable only by spending a live model.
+     *
+     * `report.txt` above stays as it was, and is now also the negative half of
+     * the same test: it is an artifact that is *not* on the inline list, so a
+     * test can assert that A14R carried three names and not every name. */
+    if (st == ATLAS_OK) {
+        static const char ANSWER[] = "the fake driver has nothing to report\n";
+        st = atlas_ws_write(req->ws, "artifacts/" ATLAS_ORCH_RESULT_TEXT_NAME, ANSWER,
+                            sizeof ANSWER - 1u, err);
+    }
     if (st == ATLAS_OK) {
         atlas_buf log = ATLAS_BUF_INIT;
         atlas_status ls = atlas_buf_appendf(&log, err, "fake driver ran for job %s\n",
@@ -452,6 +467,7 @@ static atlas_status read_service_credential(atlas_buf *out, bool *present_out, a
 }
 
 size_t atlas_driver_claude_build_argv(const atlas_driver_req *req, const char *exe,
+                                      char budget_buf[ATLAS_DRIVER_BUDGET_ARG_MAX],
                                       const char **argv_out, size_t cap) {
     if (argv_out == NULL || cap == 0) {
         return 0;
@@ -464,7 +480,15 @@ size_t atlas_driver_claude_build_argv(const atlas_driver_req *req, const char *e
         return 0;
     }
     const bool with_model = req->model != NULL && req->model[0] != '\0';
-    const size_t n = with_model ? 9u : 7u;
+    /* A14R. A bound is named or it is not; a caller that passes no storage for
+     * it has named none, and out-of-range is treated as unnamed rather than
+     * clamped — a silently reduced budget is one whose author and reader
+     * disagree about what was asked for. The policy refuses an out-of-range
+     * value long before this, so reaching here means a caller built the request
+     * by hand. */
+    const bool with_budget = budget_buf != NULL && req->max_cost_cents > 0 &&
+                             req->max_cost_cents <= ATLAS_ORCH_MAX_COST_CENTS;
+    const size_t n = 7u + (with_model ? 2u : 0u) + (with_budget ? 2u : 0u);
     if (cap < n + 1u) {
         return 0;
     }
@@ -496,6 +520,21 @@ size_t atlas_driver_claude_build_argv(const atlas_driver_req *req, const char *e
          * that configured none runs exactly the command that shipped before. */
         argv_out[k++] = "--model";
         argv_out[k++] = req->model;
+    }
+    if (with_budget) {
+        /* A14R. The CLI's own dollar bound, from the root-owned policy, on the
+         * same terms as `--model`. Verified against the installed 2.1.263:
+         * "Maximum dollar amount to spend on API calls (only works with
+         * --print)", and `--print` is on this vector two elements above.
+         *
+         * Formatted from integer cents so the decimal is exact — the amount
+         * reaches the child as text either way, and text produced from a double
+         * is text that can round. */
+        (void)snprintf(budget_buf, ATLAS_DRIVER_BUDGET_ARG_MAX, "%lld.%02lld",
+                       (long long)(req->max_cost_cents / 100),
+                       (long long)(req->max_cost_cents % 100));
+        argv_out[k++] = "--max-budget-usd";
+        argv_out[k++] = budget_buf;
     }
     /* Last, always. The task text is passed as a single argv element: it is
      * never concatenated into a command line and never reaches a shell, so
@@ -645,8 +684,10 @@ static atlas_status claude_exec(const atlas_driver_req *req, atlas_driver_res *r
      * executed with is a thing a test can read rather than a thing this
      * function alone knows. */
     const char *argv[ATLAS_DRIVER_CLAUDE_ARGV_MAX];
+    char budget_arg[ATLAS_DRIVER_BUDGET_ARG_MAX];
+    budget_arg[0] = '\0';
     if (st == ATLAS_OK &&
-        atlas_driver_claude_build_argv(req, atlas_buf_cstr(&exe), argv,
+        atlas_driver_claude_build_argv(req, atlas_buf_cstr(&exe), budget_arg, argv,
                                        ATLAS_DRIVER_CLAUDE_ARGV_MAX) == 0) {
         st = atlas_err_set(err, ATLAS_ERR_INTERNAL,
                            "the driver's command line could not be built");
@@ -756,6 +797,45 @@ static atlas_status claude_exec(const atlas_driver_req *req, atlas_driver_res *r
     /* A10.0. Read once, from the stream Atlas captured, and never from anything
      * the worker asserted about itself in a separate document. */
     atlas_usage_from_stream(out.out.data, out.out.len, &res->usage);
+
+    /* A14R. The other two things the same final record carries: what the worker
+     * answered, and why it stopped.
+     *
+     * Read from the same captured stream and on the same terms — Atlas' own
+     * copy, never a file the worker wrote. A failure to read it costs the
+     * answer and never the attempt: a run that did the work is not reclassified
+     * because its transcript could not be summarised. */
+    {
+        atlas_orch_final fin;
+        atlas_err fin_err;
+        atlas_err_init(&fin_err);
+        if (atlas_orch_final_from_stream(out.out.data, out.out.len, &fin, &fin_err) == ATLAS_OK &&
+            fin.present) {
+            /* The answer becomes an ordinary artifact, so it travels, is
+             * digested, is bounded and is read by exactly the machinery every
+             * other artifact already goes through. Written after the child has
+             * exited, so a worker that wrote a file of this name into
+             * `artifacts/` itself is overwritten rather than believed. */
+            if (req->ws != NULL) {
+                atlas_err ignore;
+                atlas_err_init(&ignore);
+                (void)atlas_ws_write(req->ws, "artifacts/" ATLAS_ORCH_RESULT_TEXT_NAME,
+                                     fin.text.data, fin.text.len, &ignore);
+            }
+            /* Atlas' own observations of the process win: a cancellation, a
+             * bound Atlas enforced, a signal and a failure to spawn are all
+             * things Atlas measured from outside, and a worker's account of
+             * itself never overrides one. What the record can refine is the
+             * case where all Atlas saw was an exit status. */
+            if (fin.subtype == ATLAS_ORCH_RESULT_SUBTYPE_ERROR_MAX_BUDGET_USD &&
+                (res->exit_kind == ATLAS_ORCH_EXIT_NONZERO ||
+                 res->exit_kind == ATLAS_ORCH_EXIT_MALFORMED_RESULT ||
+                 res->exit_kind == ATLAS_ORCH_EXIT_OK)) {
+                res->exit_kind = ATLAS_ORCH_EXIT_BUDGET_EXHAUSTED;
+            }
+        }
+        atlas_orch_final_free(&fin);
+    }
     atlas_buf_free(&ppath);
     atlas_buf_free(&out.line);
     atlas_buf_free(&out.out);

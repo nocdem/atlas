@@ -297,6 +297,7 @@ add_library(atlas_core STATIC
   src/orch/validate.c
   src/orch/rundriver.c
   src/orch/usage.c
+  src/orch/jobresult.c
   src/orch/memory.c
   src/orch/dispatch.c
   src/orch/snapshot.c

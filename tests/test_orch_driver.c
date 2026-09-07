@@ -31,6 +31,7 @@
 
 #include "atlas/atlas.h"
 #include "atlas/driver.h"
+#include "atlas/orch_jobresult.h"
 #include "atlas/git.h"
 #include "atlas/orch.h"
 #include "atlas/proc.h"
@@ -320,11 +321,12 @@ static void test_the_model_flag_is_absent_unless_the_policy_named_one(void) {
     denv e;
     denv_open(&e);
     static const char *const TASK = "$(id); do the thing";
+    char budget[ATLAS_DRIVER_BUDGET_ARG_MAX];
     const char *argv[ATLAS_DRIVER_CLAUDE_ARGV_MAX];
     atlas_driver_req req;
     fill_req(&e, &req, TASK);
 
-    size_t n = atlas_driver_claude_build_argv(&req, "/usr/bin/claude", argv,
+    size_t n = atlas_driver_claude_build_argv(&req, "/usr/bin/claude", budget, argv,
                                               ATLAS_DRIVER_CLAUDE_ARGV_MAX);
     T_REQUIRE(n >= 2u && n < ATLAS_DRIVER_CLAUDE_ARGV_MAX);
     T_CHECK(argv[n] == NULL);
@@ -339,7 +341,7 @@ static void test_the_model_flag_is_absent_unless_the_policy_named_one(void) {
     /* With a model named, exactly two elements are added: the flag and its
      * value, in that order, before the task — which is still last. */
     req.model = "fable";
-    n = atlas_driver_claude_build_argv(&req, "/usr/bin/claude", argv,
+    n = atlas_driver_claude_build_argv(&req, "/usr/bin/claude", budget, argv,
                                        ATLAS_DRIVER_CLAUDE_ARGV_MAX);
     T_CHECK_MSG(n == plain + 2u, "naming a model changed the vector by %zu elements",
                 n - plain);
@@ -360,7 +362,7 @@ static void test_the_model_flag_is_absent_unless_the_policy_named_one(void) {
 
     /* An empty name is not a model. It is a policy that named none. */
     req.model = "";
-    n = atlas_driver_claude_build_argv(&req, "/usr/bin/claude", argv,
+    n = atlas_driver_claude_build_argv(&req, "/usr/bin/claude", budget, argv,
                                        ATLAS_DRIVER_CLAUDE_ARGV_MAX);
     T_CHECK(n == plain);
     for (size_t i = 0; i < n; i++) {
@@ -370,11 +372,172 @@ static void test_the_model_flag_is_absent_unless_the_policy_named_one(void) {
     /* A vector that cannot be built is refused rather than truncated: a short
      * buffer would otherwise produce a run without its task. */
     req.model = "fable";
-    T_CHECK(atlas_driver_claude_build_argv(&req, "/usr/bin/claude", argv, plain + 1u) == 0);
+    T_CHECK(atlas_driver_claude_build_argv(&req, "/usr/bin/claude", budget, argv, plain + 1u) == 0);
     req.task = NULL;
-    T_CHECK(atlas_driver_claude_build_argv(&req, "/usr/bin/claude", argv,
+    T_CHECK(atlas_driver_claude_build_argv(&req, "/usr/bin/claude", budget, argv,
                                            ATLAS_DRIVER_CLAUDE_ARGV_MAX) == 0);
     denv_close(&e);
+}
+
+/* A14R. The budget flag, on the same terms as the model flag and asserted the
+ * same way: it appears only when the policy named a bound, it is exactly two
+ * elements, the task stays last, and the amount is exact. */
+static void test_the_budget_flag_is_absent_unless_the_policy_named_one(void) {
+    denv e;
+    denv_open(&e);
+    static const char *const TASK = "do the thing";
+    char budget[ATLAS_DRIVER_BUDGET_ARG_MAX];
+    const char *argv[ATLAS_DRIVER_CLAUDE_ARGV_MAX];
+    atlas_driver_req req;
+    fill_req(&e, &req, TASK);
+
+    size_t plain = atlas_driver_claude_build_argv(&req, "/usr/bin/claude", budget, argv,
+                                                  ATLAS_DRIVER_CLAUDE_ARGV_MAX);
+    T_REQUIRE(plain >= 2u);
+    for (size_t i = 0; i < plain; i++) {
+        T_CHECK_MSG(strcmp(argv[i], "--max-budget-usd") != 0,
+                    "a budget flag appeared although the policy named none");
+    }
+
+    /* $50, the value this deployment's policy carries. */
+    req.max_cost_cents = 5000;
+    size_t n = atlas_driver_claude_build_argv(&req, "/usr/bin/claude", budget, argv,
+                                              ATLAS_DRIVER_CLAUDE_ARGV_MAX);
+    T_CHECK_MSG(n == plain + 2u, "naming a budget changed the vector by %zu elements",
+                n - plain);
+    T_CHECK(argv[n] == NULL);
+    T_CHECK_MSG(argv[n - 1u] == TASK, "the task is no longer the last argument");
+    size_t flag = 0;
+    size_t seen = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(argv[i], "--max-budget-usd") == 0) {
+            flag = i;
+            seen++;
+        }
+    }
+    T_CHECK_MSG(seen == 1u, "the budget flag appeared %zu times", seen);
+    T_REQUIRE(flag + 1u < n);
+    T_CHECK_MSG(strcmp(argv[flag + 1u], "50.00") == 0, "the amount was %s, not 50.00",
+                argv[flag + 1u]);
+
+    /* A value the policy would have refused is treated as no bound at all, not
+     * as a clamped one: a silently reduced budget is one whose author and
+     * reader disagree about what was asked for. */
+    req.max_cost_cents = ATLAS_ORCH_MAX_COST_CENTS + 1;
+    n = atlas_driver_claude_build_argv(&req, "/usr/bin/claude", budget, argv,
+                                       ATLAS_DRIVER_CLAUDE_ARGV_MAX);
+    T_CHECK(n == plain);
+    for (size_t i = 0; i < n; i++) {
+        T_CHECK(strcmp(argv[i], "--max-budget-usd") != 0);
+    }
+
+    /* Zero is "no bound named" and is the ordinary state. */
+    req.max_cost_cents = 0;
+    n = atlas_driver_claude_build_argv(&req, "/usr/bin/claude", budget, argv,
+                                       ATLAS_DRIVER_CLAUDE_ARGV_MAX);
+    T_CHECK(n == plain);
+
+    /* Both flags together still leave the task last, which is the invariant the
+     * whole vector exists to keep. */
+    req.model = "claude-sonnet-5";
+    req.max_cost_cents = 5000;
+    n = atlas_driver_claude_build_argv(&req, "/usr/bin/claude", budget, argv,
+                                       ATLAS_DRIVER_CLAUDE_ARGV_MAX);
+    T_CHECK_MSG(n == plain + 4u, "model and budget together changed the vector by %zu", n - plain);
+    T_CHECK(argv[n] == NULL);
+    T_CHECK_MSG(argv[n - 1u] == TASK, "the task is no longer the last argument");
+    denv_close(&e);
+}
+
+/* A14R. The final record of a stream: what the worker answered and why it
+ * stopped, read from bytes Atlas captured. */
+static void test_the_final_record_is_read_from_the_stream(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_orch_final f;
+
+    /* An ordinary success. The answer is decoded, not echoed: the escapes are
+     * resolved and the surrounding record is not part of it. */
+    static const char OK_STREAM[] =
+        "{\"type\":\"system\",\"subtype\":\"init\"}\n"
+        "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"line one\\nline \\\"two\\\"\","
+        "\"usage\":{}}\n";
+    T_OK(atlas_orch_final_from_stream(OK_STREAM, sizeof OK_STREAM - 1u, &f, &err), &err);
+    T_CHECK(f.present);
+    T_CHECK(f.subtype == ATLAS_ORCH_RESULT_SUBTYPE_SUCCESS);
+    T_CHECK(!f.text_truncated);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&f.text), "line one\nline \"two\"") == 0, "decoded as: %s",
+                atlas_buf_cstr(&f.text));
+    atlas_orch_final_free(&f);
+
+    /* The budget refusal, which is the one subtype that changes a verdict. */
+    static const char BUDGET[] =
+        "{\"type\":\"result\",\"subtype\":\"error_max_budget_usd\",\"result\":\"stopped\"}\n";
+    T_OK(atlas_orch_final_from_stream(BUDGET, sizeof BUDGET - 1u, &f, &err), &err);
+    T_CHECK(f.present);
+    T_CHECK(f.subtype == ATLAS_ORCH_RESULT_SUBTYPE_ERROR_MAX_BUDGET_USD);
+    atlas_orch_final_free(&f);
+
+    /* A subtype outside the vocabulary reads UNKNOWN rather than being carried
+     * through: a worker must not write its own words into a checked field. */
+    static const char ODD[] =
+        "{\"type\":\"result\",\"subtype\":\"something_new\",\"result\":\"x\"}\n";
+    T_OK(atlas_orch_final_from_stream(ODD, sizeof ODD - 1u, &f, &err), &err);
+    T_CHECK(f.present);
+    T_CHECK(f.subtype == ATLAS_ORCH_RESULT_SUBTYPE_UNKNOWN);
+    atlas_orch_final_free(&f);
+
+    /* The last eligible line wins, so a forged record earlier in the stream is
+     * superseded by the one the CLI actually ended with. */
+    static const char FORGED[] =
+        "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"forged\"}\n"
+        "{\"type\":\"assistant\"}\n"
+        "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"real\"}\n";
+    T_OK(atlas_orch_final_from_stream(FORGED, sizeof FORGED - 1u, &f, &err), &err);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&f.text), "real") == 0, "took: %s",
+                atlas_buf_cstr(&f.text));
+    atlas_orch_final_free(&f);
+
+    /* A stream with no final record is *absent*, not empty: a worker killed at
+     * a bound never wrote one, and reading that as "it said nothing" is the
+     * mistake that made a timed-out job's cost look like zero. */
+    static const char CUT[] = "{\"type\":\"assistant\",\"message\":{}}\n{\"type\":\"sys";
+    T_OK(atlas_orch_final_from_stream(CUT, sizeof CUT - 1u, &f, &err), &err);
+    T_CHECK(!f.present);
+    T_CHECK(f.text.len == 0);
+    atlas_orch_final_free(&f);
+
+    /* Bounded, and the reader is told. `text_full_bytes` counts the whole
+     * answer even though only a prefix is kept. */
+    {
+        atlas_buf big = ATLAS_BUF_INIT;
+        T_OK(atlas_buf_set_str(&big, "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"",
+                               &err),
+             &err);
+        for (size_t i = 0; i < ATLAS_ORCH_RESULT_TEXT_MAX + 4096u; i++) {
+            T_OK(atlas_buf_append(&big, "a", 1u, &err), &err);
+        }
+        T_OK(atlas_buf_append(&big, "\"}", 2u, &err), &err);
+        T_OK(atlas_orch_final_from_stream(big.data, big.len, &f, &err), &err);
+        T_CHECK(f.present);
+        T_CHECK_MSG(f.text.len <= (size_t)ATLAS_ORCH_RESULT_TEXT_MAX,
+                    "kept %zu bytes, bound is %u", f.text.len,
+                    (unsigned)ATLAS_ORCH_RESULT_TEXT_MAX);
+        T_CHECK_MSG(f.text_truncated, "an oversized answer was not marked truncated");
+        T_CHECK_MSG(f.text_full_bytes == (int64_t)(ATLAS_ORCH_RESULT_TEXT_MAX + 4096u),
+                    "full length reported as %lld", (long long)f.text_full_bytes);
+        atlas_orch_final_free(&f);
+        atlas_buf_free(&big);
+    }
+
+    /* A `\u` escape is decoded to UTF-8, and an unpaired surrogate becomes the
+     * replacement character rather than an invalid sequence. */
+    static const char UNI[] =
+        "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"\\u00e7 \\ud800\"}\n";
+    T_OK(atlas_orch_final_from_stream(UNI, sizeof UNI - 1u, &f, &err), &err);
+    T_CHECK_MSG(strcmp(atlas_buf_cstr(&f.text), "\xc3\xa7 \xef\xbf\xbd") == 0, "decoded as: %s",
+                atlas_buf_cstr(&f.text));
+    atlas_orch_final_free(&f);
 }
 
 /* --- A12.0: the planner's test double --------------------------------------- */
@@ -801,6 +964,9 @@ static const atlas_test TESTS[] = {
      test_the_model_a_driver_runs_under_follows_its_role},
     {"the model flag is absent unless the policy named one",
      test_the_model_flag_is_absent_unless_the_policy_named_one},
+    {"the budget flag is absent unless the policy named one",
+     test_the_budget_flag_is_absent_unless_the_policy_named_one},
+    {"the final record is read from the stream", test_the_final_record_is_read_from_the_stream},
     {"the fake plan driver emits the plan it was given",
      test_the_fake_plan_driver_emits_the_plan_it_was_given},
     {"the fake plan driver fails rather than inventing a plan",

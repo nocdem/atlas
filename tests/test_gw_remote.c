@@ -391,6 +391,7 @@ static void test_no_credential_can_reach_a_write_tool(void) {
      * with the "jobs:submit" scope sentence. */
     static const char *const SUBMIT_WRITES[] = {
         "atlas_job_submit", "atlas_job_status", "atlas_job_list", "atlas_job_cancel",
+        "atlas_job_result",
     };
     for (size_t i = 0; i < sizeof SUBMIT_WRITES / sizeof SUBMIT_WRITES[0]; i++) {
         char msg[512];
@@ -455,7 +456,8 @@ static void test_no_credential_can_reach_a_write_tool(void) {
      * is not grantable through `atlas api-key create`. A credential holding
      * every grantable scope finds it unset and gets the scope sentence. */
     static const char *const JOB_TOOLS[] = {"atlas_job_submit", "atlas_job_status",
-                                             "atlas_job_list", "atlas_job_cancel"};
+                                             "atlas_job_list", "atlas_job_cancel",
+                                             "atlas_job_result"};
     for (size_t i = 0; i < sizeof JOB_TOOLS / sizeof JOB_TOOLS[0]; i++) {
         char msg[512];
         (void)snprintf(msg, sizeof msg,
@@ -831,8 +833,27 @@ static void test_the_audit_trail_records_what_happened(void) {
     atlas_buf db_path = ATLAS_BUF_INIT;
     T_OK(atlas_buf_appendf(&db_path, &err, "%s/atlas.db", fx_data_dir(&e.fx)), &err);
 
-    const char *secret_body = strrchr(e.token, '_');
+    /* The secret is everything after the *second* underscore: a token is
+     * `atlas_<selector>_<secret>`.
+     *
+     * This was `strrchr`, which searches from the end — and the secret is
+     * base64url, whose alphabet ends `-_` (`B64URL` in `src/gw/apikey.c`). A
+     * secret containing an underscore, which about half of them do, made
+     * `secret_body` a short suffix of itself: with the last underscore near the
+     * end it could be one or two characters, and a one-character needle is
+     * found in any hundred-kilobyte file. The test then failed for a reason
+     * that had nothing to do with a leak, on roughly the runs where the random
+     * secret happened to end that way.
+     *
+     * Parsed forward instead, so the needle is the whole 43-character secret
+     * every time. That is also the stronger assertion: the old one was
+     * searching for a fragment. */
+    const char *secret_body = strchr(e.token, '_');
+    secret_body = secret_body != NULL ? strchr(secret_body + 1, '_') : NULL;
     secret_body = secret_body != NULL ? secret_body + 1 : "";
+    T_REQUIRE_MSG(strlen(secret_body) > 8u,
+                  "the token did not parse into a secret worth searching for: \"%s\"",
+                  secret_body);
 
     /* The rows are written by the daemon's writer thread, so poll for the
      * observable outcome rather than guessing at a sleep. */

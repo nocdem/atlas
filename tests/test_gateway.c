@@ -302,12 +302,42 @@ static void test_every_malformed_policy_disables_the_gateway(void) {
          "remote_submit_driver = claude\nremote_submit_mode = patch\n"
          "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
          "remote_submit_max_active = 9\nremote_submit_max_per_day = 6\n"},
-        {"remote_submit_max_per_day of 0",
+        /* A14R removed the "max_per_day of 0" case from this table: zero is now
+         * the policy's way of saying "no daily bound" and loads ENABLED. It is
+         * asserted in `test_a_daily_bound_of_zero_is_unlimited` below, where the
+         * *meaning* can be checked rather than only the refusal. Everything
+         * either side of the range is still MALFORMED, which the case below and
+         * the negative-number case keep true. */
+        {"remote_submit_max_per_day that is not a number",
          "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
          "remote_submit_key = key_b2578f48143c06d3\n"
          "remote_submit_driver = claude\nremote_submit_mode = patch\n"
          "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
-         "remote_submit_max_active = 2\nremote_submit_max_per_day = 0\n"},
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = none\n"},
+        /* A14R: the machine-wide bound. Zero is refused here rather than read as
+         * unbounded, because an operator who wrote it meant a bound and would
+         * otherwise get the opposite of one; unbounded is the absent line. */
+        {"remote_submit_max_active_total of 0",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"
+         "remote_submit_max_active_total = 0\n"},
+        {"remote_submit_max_active_total above ceiling (32)",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"
+         "remote_submit_max_active_total = 33\n"},
+        {"duplicate remote_submit_max_active_total line",
+         "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+         "remote_submit_key = key_b2578f48143c06d3\n"
+         "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+         "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+         "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"
+         "remote_submit_max_active_total = 6\nremote_submit_max_active_total = 4\n"},
         {"remote_submit_max_per_day above ceiling (64)",
          "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
          "remote_submit_key = key_b2578f48143c06d3\n"
@@ -732,6 +762,78 @@ static void test_remote_submit_keys_parse_a_complete_policy(void) {
                   atlas_gwpolicy_reason_name(p3.reason));
     T_CHECK_MSG(p3.cleartext_disposal_accepted, "cleartext_disposal_accepted was false");
     T_CHECK_MSG(p3.cleartext_submission_accepted, "cleartext_submission_accepted was false");
+}
+
+/* A14R. Zero is the policy's way of writing "no daily bound", and it is the one
+ * value in the submission block where zero is a decision rather than an absence.
+ *
+ * A14 read 1..64 and made 0 MALFORMED, so an operator who wanted no daily limit
+ * had to write the ceiling and call it unlimited — a documented bound that is
+ * not the implemented bound, one layer up. What keeps zero from being reachable
+ * by accident is that the key stays in the all-or-none set: omitting the line
+ * refuses the whole policy, so unlimited can only be written on purpose. */
+static void test_a_daily_bound_of_zero_is_unlimited(void) {
+    atlas_gwpolicy p;
+    parse_policy("enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\n"
+                 "tls_mode = REVERSE_PROXY\n"
+                 "remote_submit_key = key_b2578f48143c06d3\n"
+                 "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+                 "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+                 "remote_submit_max_active = 2\nremote_submit_max_per_day = 0\n",
+                 &p);
+    T_REQUIRE_MSG(p.state == ATLAS_GWPOLICY_ENABLED,
+                  "an unlimited daily bound was refused: %s",
+                  atlas_gwpolicy_reason_name(p.reason));
+    T_CHECK_MSG(p.remote_submit_max_per_day == 0, "max_per_day was %lld, not 0",
+                p.remote_submit_max_per_day);
+
+    /* Omitting the line is still MALFORMED, so zero cannot be arrived at by
+     * leaving it out — which is what would make "unlimited" a default. */
+    atlas_gwpolicy p2;
+    parse_policy("enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\n"
+                 "tls_mode = REVERSE_PROXY\n"
+                 "remote_submit_key = key_b2578f48143c06d3\n"
+                 "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+                 "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+                 "remote_submit_max_active = 2\n",
+                 &p2);
+    T_CHECK_MSG(p2.state != ATLAS_GWPOLICY_ENABLED,
+                "omitting max_per_day loaded ENABLED, so unlimited became a default");
+}
+
+/* A14R. The machine-wide active bound: optional, bounded, and zero when absent
+ * so a policy that never named one keeps A14's behaviour exactly. */
+static void test_the_total_active_bound_is_optional_and_bounded(void) {
+    atlas_gwpolicy p;
+    parse_policy("enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\n"
+                 "tls_mode = REVERSE_PROXY\n"
+                 "remote_submit_key = key_b2578f48143c06d3\n"
+                 "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+                 "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+                 "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n"
+                 "remote_submit_max_active_total = 6\n",
+                 &p);
+    T_REQUIRE_MSG(p.state == ATLAS_GWPOLICY_ENABLED,
+                  "a policy naming a total bound was refused: %s",
+                  atlas_gwpolicy_reason_name(p.reason));
+    T_CHECK_MSG(p.remote_submit_max_active_total == 6, "max_active_total was %lld",
+                p.remote_submit_max_active_total);
+
+    /* Absent is zero, which the write point reads as "no bound named" and skips
+     * the count for. It is deliberately not in the all-or-none set: a machine
+     * that never wrote the line is a machine A14R did not change. */
+    atlas_gwpolicy p2;
+    parse_policy("enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\n"
+                 "tls_mode = REVERSE_PROXY\n"
+                 "remote_submit_key = key_b2578f48143c06d3\n"
+                 "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+                 "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+                 "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n",
+                 &p2);
+    T_REQUIRE_MSG(p2.state == ATLAS_GWPOLICY_ENABLED, "omitting the total bound was refused: %s",
+                  atlas_gwpolicy_reason_name(p2.reason));
+    T_CHECK_MSG(p2.remote_submit_max_active_total == 0, "absent total bound read as %lld",
+                p2.remote_submit_max_active_total);
 }
 
 /* A14. Remote submission absent by default. */
@@ -1294,15 +1396,23 @@ static void test_every_write_route_is_a_disposal_on_the_reviewed_allowlist(void)
     static const char *const GATEWAY_ONLY = "gateway.auth";
     static const char *const GATEWAY_AUDIT = "gateway.audit";
 
-    /* The whole write table, by name -- the two disposal methods A16 adds and
-     * the four submission methods A14 adds. Not generated from the table, on
-     * `READ_METHODS[]`'s own precedent above: a seventh row naming anything
-     * else fails loudly here, the moment it is added. */
+    /* The whole write table, by name -- the two disposal methods A16 adds, the
+     * four submission methods A14 adds, and A14R's `job.remote_result`. Not
+     * generated from the table, on `READ_METHODS[]`'s own precedent above: an
+     * eighth row naming anything else fails loudly here, the moment it is
+     * added.
+     *
+     * `job.remote_result` is on the *write* table because these rows are the
+     * POST routes, not because it writes: it writes no row, starts no process
+     * and applies nothing. What puts it here is that it carries a credential in
+     * a body, and the property this test enforces -- an ungrantable scope, no
+     * operator method, a bounded body -- is exactly the one it must satisfy. */
     static const char *const WRITE_METHODS[] = {
         "decision.remote_challenge",
         "decision.remote_dispose",
         "job.remote_submit",
         "job.remote_get",
+        "job.remote_result",
         "job.remote_list",
         "job.remote_cancel",
     };
@@ -1322,7 +1432,7 @@ static void test_every_write_route_is_a_disposal_on_the_reviewed_allowlist(void)
             }
         }
         T_CHECK_MSG(allowed,
-                    "write route %s forwards to %s, which is not on the six-method allowlist",
+                    "write route %s forwards to %s, which is not on the reviewed write allowlist",
                     r->path, r->method);
 
         T_CHECK_MSG(r->scope == ATLAS_SCOPE_DECISIONS_DISPOSE ||
@@ -1378,6 +1488,9 @@ static const atlas_test TESTS[] = {
     {"the cleartext disposal acceptance", test_the_cleartext_disposal_acceptance},
     {"remote submit keys parse a complete policy",
      test_remote_submit_keys_parse_a_complete_policy},
+    {"a daily bound of zero is unlimited", test_a_daily_bound_of_zero_is_unlimited},
+    {"the total active bound is optional and bounded",
+     test_the_total_active_bound_is_optional_and_bounded},
     {"remote submission is absent by default", test_remote_submit_is_absent_by_default},
     {"gateway status prints dispose and clear", test_gateway_status_prints_dispose_and_clear},
     {"gateway status prints submit and clear-submit",

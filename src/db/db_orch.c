@@ -1325,8 +1325,40 @@ static atlas_status op_submit(atlas_db *db, const atlas_orch_op *op, atlas_orch_
             return bs;
         }
 
-        /* Daily budget: count root submissions today for this key (UTC). */
-        if (s->parent_job_uid.len == 0) {
+        /* A14R. Machine-wide active budget: the same definition of "active",
+         * counted over every credential rather than over this one.
+         *
+         * Checked after the per-credential bound and before the daily one, so
+         * the narrower refusal is the one a caller sees when both apply — a
+         * message naming the caller's own key is more actionable than one about
+         * a machine they share. Zero is "no bound named" and skips the count
+         * entirely: a policy that never wrote the line keeps A14's behaviour,
+         * and a bound of zero is refused by the parser rather than read here as
+         * "refuse everything". */
+        if (op->remote_max_active_total > 0) {
+            int64_t total_active = 0;
+            st = atlas_db_orch_remote_active_total(db, &total_active, err);
+            if (st != ATLAS_OK) {
+                atlas_buf_free(&ns_key);
+                return st;
+            }
+            if (total_active >= op->remote_max_active_total) {
+                atlas_status bs = atlas_err_set(
+                    err, ATLAS_ERR_USAGE,
+                    "this machine already has %lld active remote job(s) across all credentials,"
+                    " which is the policy's bound of %lld; it takes no further one until one of"
+                    " them ends",
+                    (long long)total_active, (long long)op->remote_max_active_total);
+                atlas_buf_free(&ns_key);
+                return bs;
+            }
+        }
+
+        /* Daily budget: count root submissions today for this key (UTC).
+         * A14R: `remote_max_per_day == 0` is the policy's "no daily bound" and
+         * skips the count. It is reachable only by an operator writing `0`, and
+         * never by a line being left out — the key is in the all-or-none set. */
+        if (s->parent_job_uid.len == 0 && op->remote_max_per_day > 0) {
             /* Derive the UTC midnight string from the current wall clock.
              * `atlas_now_iso8601` emits the full ISO-8601 timestamp; the first
              * 10 chars are the YYYY-MM-DD date, and appending "T00:00:00Z"
@@ -3377,6 +3409,24 @@ static atlas_status op_complete(atlas_db *db, const atlas_orch_op *op, atlas_orc
          * the task, and below it ends the run. */
         to = ATLAS_ORCH_STATE_FAILED;
         reason = ATLAS_ORCH_REASON_POLICY_REFUSED;
+    } else if (op->failure_reason == ATLAS_ORCH_REASON_BUDGET_EXHAUSTED) {
+        /* A14R. The attempt reached the root-owned dollar bound.
+         *
+         * It ends the task rather than retrying it, for the reason a failed
+         * gate does: another attempt at the same task under the same bound
+         * spends the same money to arrive in the same place, and the retry
+         * branch below would do exactly that up to `max_attempts` times.
+         *
+         * Unlike a failed gate it spawns no follow-up either — a narrower task
+         * is Atlas' answer to work that came out wrong, and this is work that
+         * did not finish. Producing one would spend the *next* budget on a
+         * guess about why the last one ran out.
+         *
+         * Not conditioned on `in_run`, unlike the two branches above: those
+         * describe what a *run* should do next, and this describes what this
+         * task did, which is true whether or not it belongs to a chain. */
+        to = ATLAS_ORCH_STATE_FAILED;
+        reason = ATLAS_ORCH_REASON_BUDGET_EXHAUSTED;
     } else if (lr.attempt_no < j.max_attempts &&
                (!in_run || starts < ATLAS_ORCH_RUN_MAX_WORKER_STARTS)) {
         /* Bounded retry with a recorded reason, and never an infinite loop: the
@@ -4370,16 +4420,20 @@ atlas_status atlas_db_orch_job_list_remote(atlas_db *db, int64_t after_id, int64
                               err);
 }
 
+/* The terminal set, spelled once for both remote active counts.
+ *
+ * It must stay in sync with `atlas_orch_state_is_terminal` and with
+ * `idx_orch_jobs_state`'s WHERE clause; those three are compared against each
+ * other in `test_orch_run.c`. A14R added a second query that needs the same
+ * predicate and made it a macro rather than a fourth copy — two spellings of
+ * one rule drift, which is the reason the comparison test exists at all. */
+#define ORCH_NOT_TERMINAL_SQL \
+    " state NOT IN ('SUCCEEDED','FAILED','CANCELLED','TIMED_OUT','RECOVERY_REQUIRED')"
+
 atlas_status atlas_db_orch_remote_active_count(atlas_db *db, const char *key_id, int64_t *out,
                                                atlas_err *err) {
-    /* The NOT IN predicate must stay in sync with `atlas_orch_state_is_terminal`
-     * and with `idx_orch_jobs_state`'s WHERE clause. The spelling here is the
-     * third copy of the terminal set (after the C function and the index); all
-     * three are compared against each other in `test_orch_run.c`. */
-    static const char SQL[] =
-        "SELECT COUNT(*) FROM orch_jobs"
-        " WHERE submit_key_id = ?1"
-        "   AND state NOT IN ('SUCCEEDED','FAILED','CANCELLED','TIMED_OUT','RECOVERY_REQUIRED');";
+    static const char SQL[] = "SELECT COUNT(*) FROM orch_jobs"
+                              " WHERE submit_key_id = ?1 AND" ORCH_NOT_TERMINAL_SQL ";";
     sqlite3_stmt *st = NULL;
     atlas_status s = atlas_db_prepare(db, SQL, &st, err);
     if (s != ATLAS_OK) {
@@ -4388,6 +4442,32 @@ atlas_status atlas_db_orch_remote_active_count(atlas_db *db, const char *key_id,
     s = atlas_db_bind_text_opt(db, st, 1, key_id != NULL ? key_id : "", err);
     if (s != ATLAS_OK) {
         atlas_db_finish(db, st);
+        return s;
+    }
+    int64_t v = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        v = sqlite3_column_int64(st, 0);
+    }
+    atlas_db_finish(db, st);
+    if (out != NULL) {
+        *out = v;
+    }
+    return ATLAS_OK;
+}
+
+/* A14R. Active remote jobs across every credential.
+ *
+ * `submit_key_id <> ''` is what makes it "remote": an empty one is how a job
+ * submitted over the local socket records that no credential queued it, so a
+ * local `atlas job submit` never counts against a bound the gateway's callers
+ * share. Same terminal predicate as the per-credential count, from the same
+ * macro, so the two cannot come to disagree about what active means. */
+atlas_status atlas_db_orch_remote_active_total(atlas_db *db, int64_t *out, atlas_err *err) {
+    static const char SQL[] = "SELECT COUNT(*) FROM orch_jobs"
+                              " WHERE submit_key_id <> '' AND" ORCH_NOT_TERMINAL_SQL ";";
+    sqlite3_stmt *st = NULL;
+    atlas_status s = atlas_db_prepare(db, SQL, &st, err);
+    if (s != ATLAS_OK) {
         return s;
     }
     int64_t v = 0;

@@ -133,6 +133,77 @@ do. The transcript chain that this does not close: a credential holder can read
 `job.remote_get`'s `reason` and `usage` fields but never the worker's prose.
 The chain is this season's stated cost; no fix is offered.
 
+> **Decision 7 is revised by A14R, narrowly and on purpose.** The paragraph
+> above stands as what A14 decided and why; this is what changed and what did
+> not. See "Decision 7R" below.
+
+**Decision 7R (A14R) — three named artifacts, and nothing a caller can choose.**
+
+*What made the original wrong.* Decision 7 was not a bound on a capability, it
+was a bound on a capability nobody had. Two things were measured after A14
+shipped:
+
+1. **The escape hatch did not exist.** Decision 7 and §4 both name the path an
+   operator was to use instead — "the Atlas machine and the terminal command
+   `atlas job artifact`". There is no such subcommand. `grep -c artifact
+   src/cli/cli.c` is `0`, and the binary answers `unknown job subcommand
+   "artifact"`. The RPC method `job.artifact` exists and has one caller,
+   `src/core/service_plan.c`, which uses it for plan revisions only.
+2. **For an executor driver the bytes were destroyed anyway.**
+   `artifacts_travel_inline` asked the driver's *role* and only a `PLANNER`
+   answered yes, so a `claude` attempt's artifacts were recorded as name, size
+   and digest with `content_stored = 0`; the dispatcher then removed a
+   successful attempt's workspace, as it always does. Measured on the
+   deployment this season was written for: job `j61d9fbb…` ended `SUCCEEDED` on
+   2026-09-06 and its attempt directory holds zero files.
+
+So the thing Decision 7 called a "stated cost" was not a narrower channel with a
+documented alternative. It was a job whose output no one could read by any
+route, and a steward who could start work and never see it. The human approval
+gate the whole arrangement rests on had nothing to read.
+
+*What A14R returns, and only this.* Three artifacts, named as compile-time
+constants in `atlas/orch.h`, each **composed by Atlas rather than chosen by a
+worker**:
+
+| Name | Produced by | Bound |
+| --- | --- | --- |
+| `result.txt` | the driver, from the final record of the stream Atlas captured | 32 KiB |
+| `changes.patch` | `atlas_ws_make_patch`, a content diff of the two trees | 256 KiB |
+| `validations.txt` | the dispatcher, from `atlas_validations_run`'s own verdicts | 32 KiB |
+
+Each is written **after** the driver has exited, so a worker that writes a file
+of one of these names into `artifacts/` is overwritten rather than believed.
+
+*What did not change.* `job.remote_apply`, `job.remote_artifact`,
+`job.remote_log` and `job.remote_run` are still forbidden names and
+`tests/test_orch_rpc.c` still scans for them. `job.remote_result` is not
+`job.remote_artifact` renamed: **it takes no artifact parameter**, so "a caller
+may not name a file" is a property of the signature and of the gateway route
+row, not a check that could be forgotten. A worker's `logs/stdout.log` is
+reachable under no name. Nothing is applied, committed, approved or accepted;
+the method writes no row and starts no process.
+
+*The bound that is a real bound.* Artifact bytes travel hex-encoded on the
+completion, and `ATLAS_IPC_MAX_REQUEST_BYTES` is 1 MiB, so every raw byte costs
+two on the wire. `ATLAS_ORCH_RESULT_INLINE_TOTAL_MAX` is 320 KiB raw — 640 KiB
+encoded — and an artifact that would exceed the running total is recorded
+exactly as an oversized one already is: name, size, digest, `content_stored`
+false, and `unavailable_reason` on the wire. The margin is the point: a
+completion that does not fit is not a truncated artifact, it is a finished
+worker whose outcome never reaches the ledger.
+
+*The measurement bug this uncovered.* `dispatch.complete` has accepted a `usage`
+key since A10.0 and `src/orch/dispatch.c` never sent one — the word "usage" did
+not appear in that file. The run driver assigns `op->usage` directly because it
+reaches the write point in its own process; a dispatcher is a separate process
+and has to encode it. So **every job that ran through the dispatcher wrote an
+`orch_usage` row with an empty model, a NULL cost and a NULL turn count**, and
+`job.remote_get` reported `usage.present` with nothing in it. Both halves of the
+mechanism existed and nothing joined them. `job.remote_result` also reports
+`usage.complete` and an `incomplete_reason`, because a worker killed at a bound
+never writes a final record and an absent cost must not read as zero.
+
 **Decision 8 — what the gateway cannot do stays true because of who it runs
 as.** The gateway's uid reaches four new names only when a root-owned policy
 names a credential, and each of those names does nothing without that
@@ -264,6 +335,21 @@ worker's prose output, patch, log or gate output remotely. They see state,
 reason, attempts and cost. The path from a finished job to its output is the
 Atlas machine and the terminal command `atlas job artifact`. No fix is offered
 in this season; `docs/backlog.md` carries it.
+
+> **Superseded by A14R.** Two claims in the paragraph above were false when it
+> was written: `atlas job artifact` is not a command, and for a `claude` job the
+> bytes did not survive the workspace, so there was no path at all. A14R returns
+> three named, Atlas-composed artifacts through `job.remote_result` and leaves
+> every forbidden name forbidden. See Decision 7R.
+
+**What A14R still does not close.** A worker's full transcript — every tool call,
+every intermediate message, the `logs/stdout.log` the driver captured — is
+reachable from no remote route and no MCP tool. What a steward can read is the
+worker's *final answer*, the patch, and Atlas' own gate verdicts. That is enough
+to review a proposal and not enough to audit how it was reached; a job that went
+wrong in the middle still has to be read on the Atlas machine, where the failed
+attempt's workspace is kept. This one is a stated cost with a real alternative
+behind it, which is what the original was not.
 
 ## 5. The cleartext chain, verbatim
 

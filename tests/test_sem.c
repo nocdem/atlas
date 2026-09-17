@@ -33,12 +33,14 @@
 #include <unistd.h>
 
 #include "atlas/datadir.h"
+#include "atlas/decision_ops.h"
 #include "atlas/db.h"
 #include "atlas/git.h"
 #include "atlas/reconcile.h"
 #include "atlas/sem.h"
 #include "atlas/sem_ops.h"
 #include "atlas/service.h"
+#include "atlas/verify.h"
 #include "atlas_test.h"
 #include "db/db_internal.h"
 #include "support/fixture.h"
@@ -1154,6 +1156,243 @@ static void build_context(env *e, const char *task, int64_t max_tokens,
     atlas_repo_info_free(&info);
 }
 
+static bool context_has(const atlas_sem_context_report *r, const char *name, const char *file) {
+    for (size_t i = 0; i < r->count; i++) {
+        if (strcmp(r->items[i].name, name) == 0 &&
+            (file == NULL || strcmp(r->items[i].file_text, file) == 0)) return true;
+    }
+    return false;
+}
+
+static void test_context_finds_paths_prefixes_and_ambiguous_symbols(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+    env_index(&e, &err);
+    seed_repo(&e, &err);
+    T_OK(fx_write(fx_repo(&e.fx), "lookup.c",
+          "int task; int src;\n"
+          "int AtlasMixedCase(void) { return 1; }\n"
+          "int lookup_worker(void) { return AtlasMixedCase(); }\n", &err), &err);
+    const char *sources[] = {"a.c", "b.c", "lookup.c"};
+    write_compdb(&e, sources, 3, &err);
+    run_file_pass(&e, &err);
+    atlas_sem_index_summary sum;
+    index_once(&e, false, &sum, &err);
+    T_REQUIRE(sum.published);
+    const char *tasks[] = {"inspect lookup.c", "AtlasMixedCase", "review lookup_work",
+                           "improve task lookup_work", "change helper"};
+    for (size_t t = 0; t < sizeof tasks / sizeof tasks[0]; t++) {
+        atlas_sem_context_report rep;
+        build_context(&e, tasks[t], 0, &rep, &err);
+        if (t == 4) {
+            T_CHECK(context_has(&rep, "helper", "a.c"));
+            T_CHECK(context_has(&rep, "helper", "b.c"));
+        } else {
+            T_CHECK(context_has(&rep, "AtlasMixedCase", "lookup.c"));
+            if (t >= 2) {
+                T_CHECK(context_has(&rep, "lookup_worker", "lookup.c"));
+                T_CHECK(!context_has(&rep, "task", NULL));
+                bool lexical = false;
+                for (size_t i = 0; i < rep.count; i++) {
+                    if (strcmp(rep.items[i].name, "lookup_worker") == 0 &&
+                        strcmp(rep.items[i].why, ATLAS_SEM_SEL_TASK_MATCH) == 0) lexical = true;
+                }
+                T_CHECK(lexical);
+            }
+        }
+        atlas_sem_context_report_free(&rep);
+    }
+    /* Non-English text preserves explicit technical scope. It must not be
+     * split into misleading ASCII fragments or require translating filenames. */
+    atlas_sem_context_req req;
+    atlas_sem_context_req_init(&req);
+    req.task = "Bağlam sıralamasını iyileştir";
+    req.paths = "lookup.c";
+    req.paths_len = strlen(req.paths) + 1;
+    atlas_repo_info info;
+    atlas_repo_info_init(&info);
+    info.id = e.repo_id;
+    atlas_sem_context_report rep;
+    atlas_sem_context_report_init(&rep);
+    T_OK(atlas_sem_context_on(e.db, &info, &req, &rep, &err), &err);
+    T_CHECK(context_has(&rep, "lookup_worker", "lookup.c"));
+    atlas_sem_context_report_free(&rep);
+    req.paths = "../lookup.c";
+    req.paths_len = strlen(req.paths) + 1;
+    atlas_sem_context_report_init(&rep);
+    T_FAILS_WITH(atlas_sem_context_on(e.db, &info, &req, &rep, &err), ATLAS_ERR_USAGE, &err);
+    atlas_sem_context_report_free(&rep);
+    atlas_repo_info_free(&info);
+    env_close(&e);
+}
+
+static void test_context_budget_keeps_tests_and_knowledge(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+    env_index(&e, &err);
+    T_OK(fx_mkdir(fx_repo(&e.fx), "tests", &err), &err);
+    T_OK(fx_write(fx_repo(&e.fx), "work.c",
+        "extern unsigned long strlen(const char *);\n"
+        "int local_helper(void) { return 1; }\n"
+        "int work_target(void) { return (int)strlen(\"abc\") + local_helper(); }\n", &err), &err);
+    T_OK(fx_write(fx_repo(&e.fx), "tests/test_work.c",
+        "int work_target(void);\nint test_work(void) { return work_target(); }\n", &err), &err);
+    const char *sources[] = {"work.c", "tests/test_work.c"};
+    write_compdb(&e, sources, 2, &err);
+    T_OK(fx_add_all(&e.fx, fx_repo(&e.fx), &err), &err);
+    T_OK(fx_commit(&e.fx, fx_repo(&e.fx), "context selection fixture", &err), &err);
+    run_file_pass(&e, &err);
+    atlas_sem_index_summary sum;
+    index_once(&e, false, &sum, &err);
+    T_REQUIRE(sum.published);
+    atlas_decision_op op;
+    atlas_decision_op_init(&op, ATLAS_DECISION_OP_PROPOSE);
+    T_OK(atlas_buf_set_str(&op.repo_name, "fixture", &err), &err);
+    T_OK(atlas_buf_set_str(&op.revision.title, "work contract", &err), &err);
+    T_OK(atlas_buf_set_str(&op.revision.decision_text, "preserve work behavior", &err), &err);
+    op.revision.proposed_by = ATLAS_DECISION_ACTOR_MODEL_PROPOSAL;
+    atlas_decision_link link;
+    atlas_decision_link_init(&link, ATLAS_DECISION_LINK_PATH);
+    T_OK(atlas_buf_set_str(&link.path_raw, "work.c", &err), &err);
+    T_OK(atlas_buf_set_str(&link.path_text, "work.c", &err), &err);
+    T_OK(atlas_decision_revision_add_link(&op.revision, &link, &err), &err);
+    atlas_decision_link_free(&link);
+    atlas_decision_result result;
+    atlas_decision_result_init(&result);
+    T_OK(atlas_decision_apply(e.db, &op, &result, &err), &err);
+    atlas_decision_op_free(&op);
+
+    atlas_repo_info info;
+    atlas_repo_info_init(&info);
+    info.id = e.repo_id;
+    atlas_sem_context_req req;
+    atlas_sem_context_req_init(&req);
+    req.task = "change work_target";
+    req.include_history = true; /* Exercise a proposal without pretending approval. */
+    req.max_items = 3;
+    atlas_sem_context_report rep;
+    atlas_sem_context_report_init(&rep);
+    T_OK(atlas_sem_context_on(e.db, &info, &req, &rep, &err), &err);
+    T_EQ_INT(rep.count, 3);
+    T_CHECK(context_has(&rep, "work_target", "work.c"));
+    T_CHECK(context_has(&rep, "tests/test_work.c", "tests/test_work.c"));
+    T_CHECK(context_has(&rep, atlas_buf_cstr(&result.uid), "work.c"));
+    T_CHECK(!context_has(&rep, "strlen", NULL));
+    T_CHECK(rep.budget_reached);
+    for (size_t i = 0; i < rep.count; i++) {
+        if (strcmp(rep.items[i].kind, "decision") == 0) {
+            T_EQ_STR(rep.items[i].knowledge_status, "PROPOSED");
+            T_EQ_STR(rep.items[i].evidence, "LEXICAL");
+        }
+    }
+    atlas_sem_context_report_free(&rep);
+    atlas_decision_result_free(&result);
+    atlas_repo_info_free(&info);
+    env_close(&e);
+}
+
+static void test_context_explains_test_candidates_and_historical_results(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+    env_index(&e, &err);
+    T_OK(fx_mkdir(fx_repo(&e.fx), "checks", &err), &err);
+    T_OK(fx_write(fx_repo(&e.fx), "work.c", "int work_target(void) { return 1; }\n", &err), &err);
+    T_OK(fx_write(fx_repo(&e.fx), "bridge.c",
+        "int work_target(void); int bridge(void) { return work_target(); }\n", &err), &err);
+    T_OK(fx_write(fx_repo(&e.fx), "checks/case.c",
+        "int bridge(void); int check_work(void) { return bridge(); }\n", &err), &err);
+    T_OK(fx_write(fx_repo(&e.fx), "contest.c",
+        "int work_target(void); int contest(void) { return work_target(); }\n", &err), &err);
+    const char *sources[] = {"work.c", "bridge.c", "checks/case.c", "contest.c"};
+    write_compdb(&e, sources, 4, &err);
+    T_OK(fx_add_all(&e.fx, fx_repo(&e.fx), &err), &err);
+    T_OK(fx_commit(&e.fx, fx_repo(&e.fx), "test candidate fixture", &err), &err);
+    run_file_pass(&e, &err);
+    atlas_sem_index_summary sum;
+    index_once(&e, false, &sum, &err);
+    T_REQUIRE(sum.published);
+    atlas_sem_config cfg;
+    atlas_sem_config_init(&cfg);
+    T_OK(atlas_db_sem_config_get(e.db, e.repo_id, &cfg, &err), &err);
+    T_OK(atlas_buf_set_str(&cfg.test_roots, "checks", &err), &err);
+    T_OK(atlas_db_sem_config_set(e.db, &cfg, &err), &err);
+    atlas_sem_config_free(&cfg);
+
+    atlas_verify_evidence ev;
+    atlas_verify_evidence_init(&ev);
+    ev.cls = ATLAS_EVIDENCE_TEST;
+    ev.repo_id = e.repo_id;
+    T_OK(atlas_buf_set_str(&ev.path_raw, "work.c", &err), &err);
+    T_OK(atlas_buf_set_str(&ev.path_text, "work.c", &err), &err);
+    T_OK(atlas_buf_set_str(&ev.symbol, "work_target", &err), &err);
+    T_OK(atlas_buf_set_str(&ev.suite, "ctest", &err), &err);
+    T_OK(atlas_buf_set_str(&ev.test_name, "test_work_target", &err), &err);
+    T_OK(atlas_buf_set_str(&ev.result, "PASS", &err), &err);
+    T_OK(atlas_buf_set_str(&ev.commit_oid, "historical-commit", &err), &err);
+    T_OK(atlas_db_verify_evidence_insert(e.db, &ev, "2026-09-01T00:00:00Z", &err), &err);
+    atlas_buf_reset(&ev.uid);
+    T_OK(atlas_buf_set_str(&ev.result, "FAIL", &err), &err);
+    T_OK(atlas_db_verify_evidence_insert(e.db, &ev, "2026-09-02T00:00:00Z", &err), &err);
+
+    atlas_sem_context_report rep;
+    build_context(&e, "work_target", 0, &rep, &err);
+    bool transitive = false, record = false;
+    size_t records = 0;
+    for (size_t i = 0; i < rep.count; i++) {
+        atlas_sem_item *it = &rep.items[i];
+        if (strcmp(it->name, "checks/case.c") == 0) {
+            transitive = true;
+            T_EQ_STR(it->why, ATLAS_SEM_SEL_TEST_TRANSITIVE);
+            T_EQ_STR(it->test_classification, "DECLARED_ROOT");
+            T_EQ_STR(it->evidence, "PROVEN");
+        }
+        if (strcmp(it->kind, "test") == 0) {
+            records++;
+            record = true;
+            T_EQ_STR(it->test_target, "test_work_target");
+            T_EQ_STR(it->test_result, "FAIL");
+            T_EQ_STR(it->test_commit, "historical-commit");
+            T_EQ_STR(it->test_evidence_uid, atlas_buf_cstr(&ev.uid));
+            T_EQ_STR(it->evidence, "LEXICAL");
+        }
+        if (strcmp(it->file_text, "contest.c") == 0) T_EQ_STR(it->test_classification, "");
+    }
+    T_CHECK(transitive);
+    T_CHECK(record);
+    T_EQ_INT(records, 1);
+    atlas_sem_context_report_free(&rep);
+
+    /* A record survives missing compiler coverage, without proving presence. */
+    atlas_buf_reset(&ev.uid);
+    T_OK(atlas_buf_set_str(&ev.path_text, "unindexed.c", &err), &err);
+    T_OK(atlas_buf_set_str(&ev.path_raw, "unindexed.c", &err), &err);
+    T_OK(atlas_buf_set_str(&ev.symbol, "", &err), &err);
+    T_OK(atlas_db_verify_evidence_insert(e.db, &ev, "2026-09-03T00:00:00Z", &err), &err);
+    atlas_repo_info info;
+    atlas_repo_info_init(&info);
+    info.id = e.repo_id;
+    atlas_sem_context_req req;
+    atlas_sem_context_req_init(&req);
+    req.task = "review tests";
+    req.paths = "unindexed.c";
+    req.paths_len = sizeof "unindexed.c";
+    atlas_sem_context_report_init(&rep);
+    T_OK(atlas_sem_context_on(e.db, &info, &req, &rep, &err), &err);
+    T_REQUIRE(rep.count == 1);
+    T_EQ_STR(rep.items[0].kind, "test");
+    T_CHECK(rep.trust.verdict != ATLAS_SEM_VERDICT_PRESENT);
+    atlas_sem_context_report_free(&rep);
+    atlas_repo_info_free(&info);
+    atlas_verify_evidence_free(&ev);
+    env_close(&e);
+}
+
 static void test_the_context_package_is_deterministic_and_bounded(void) {
     atlas_err err;
     atlas_err_init(&err);
@@ -1191,6 +1430,35 @@ static void test_the_context_package_is_deterministic_and_bounded(void) {
                     "a context item carries a selection reason that is not Atlas' own");
     }
     T_CHECK_MSG(a.used_bytes <= a.budget_bytes, "the package exceeded its own budget");
+    T_CHECK(a.count <= ATLAS_SEM_CONTEXT_DEFAULT_ITEMS);
+    T_EQ_INT(a.budget_bytes, ATLAS_SEM_CONTEXT_DEFAULT_BYTES);
+    T_REQUIRE(a.count > 1);
+
+    /* An item ceiling is an omission even when the byte budget has room. */
+    atlas_repo_info limited_info;
+    atlas_repo_info_init(&limited_info);
+    limited_info.id = e.repo_id;
+    (void)snprintf(limited_info.name, sizeof limited_info.name, "%s", "fixture");
+    atlas_sem_context_req limited_req;
+    atlas_sem_context_req_init(&limited_req);
+    limited_req.task = "change the helper function";
+    limited_req.max_items = 1;
+    limited_req.max_tokens = INT64_MAX;
+    atlas_sem_context_report limited;
+    atlas_sem_context_report_init(&limited);
+    T_OK(atlas_sem_context_on(e.db, &limited_info, &limited_req, &limited, &err), &err);
+    T_EQ_INT(limited.budget_bytes, ATLAS_SEM_CONTEXT_MAX_BYTES);
+    T_EQ_INT((int64_t)limited.count, 1);
+    T_CHECK(limited.budget_reached);
+    bool item_limit_said = false;
+    for (size_t i = 0; i < limited.missing_count; i++) {
+        if (strcmp(limited.missing[i], ATLAS_SEM_MISSING_ITEMS) == 0) {
+            item_limit_said = true;
+        }
+    }
+    T_CHECK_MSG(item_limit_said, "an item-limited package hid its omissions");
+    atlas_sem_context_report_free(&limited);
+    atlas_repo_info_free(&limited_info);
     atlas_sem_context_report_free(&a);
     atlas_sem_context_report_free(&b);
 
@@ -1368,6 +1636,12 @@ static const atlas_test TESTS[] = {
      test_the_input_digest_does_not_depend_on_order},
     {"impact separates what was proven from what was guessed",
      test_impact_separates_what_was_proven_from_what_was_guessed},
+    {"context finds paths, prefixes and every ambiguous symbol",
+     test_context_finds_paths_prefixes_and_ambiguous_symbols},
+    {"a small context budget retains tests and recorded knowledge",
+     test_context_budget_keeps_tests_and_knowledge},
+    {"context explains transitive test candidates and historical results",
+     test_context_explains_test_candidates_and_historical_results},
     {"the context package is deterministic and bounded",
      test_the_context_package_is_deterministic_and_bounded},
     {"imperative task prose changes nothing",
@@ -1376,4 +1650,45 @@ static const atlas_test TESTS[] = {
      test_a_walk_is_bounded_and_folds_evidence},
 };
 
-ATLAS_TEST_MAIN("sem", TESTS)
+/* An explicitly disabled compiler is a supported build profile. Exercise its
+ * refusal instead of claiming that the compiler-dependent cases passed. */
+static void test_without_compiler_is_unavailable(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+    env_index(&e, &err);
+    seed_repo(&e, &err);
+    run_file_pass(&e, &err);
+
+    atlas_sem_index_opts opts;
+    atlas_sem_index_opts_init(&opts);
+    opts.root = fx_repo(&e.fx);
+    atlas_sem_index_summary sum;
+    atlas_sem_index_summary_init(&sum);
+    T_FAILS_WITH(atlas_sem_index_run(e.db, e.repo_id, &opts, &sum, &err), ATLAS_ERR_CONFIG, &err);
+    T_CHECK(strstr(atlas_err_msg(&err), "without libclang") != NULL);
+    T_CHECK(!sum.published);
+
+    atlas_buf out = ATLAS_BUF_INIT, errors = ATLAS_BUF_INIT;
+    int code = -1;
+    const char *args[] = {"--data-dir", fx_data_dir(&e.fx), "--json", "code", "sem-status", "fixture"};
+    T_OK(fx_atlas(args, sizeof args / sizeof args[0], &out, &errors, &code, &err), &err);
+    T_EQ_INT(code, 0);
+    T_CHECK(strstr(atlas_buf_cstr(&out), "\"libclang_available\":false") != NULL);
+    T_CHECK(strstr(atlas_buf_cstr(&out), "\"activity\":\"UNAVAILABLE\"") != NULL);
+    T_CHECK(strstr(atlas_buf_cstr(&out), "\"result_verdict\":\"UNKNOWN\"") != NULL);
+    atlas_buf_free(&out);
+    atlas_buf_free(&errors);
+    env_close(&e);
+}
+
+int main(void) {
+    if (!atlas_sem_available()) {
+        static const atlas_test unavailable[] = {
+            {"missing compiler is explicitly unavailable, never empty success", test_without_compiler_is_unavailable},
+        };
+        return atlas_test_run("sem (without libclang)", unavailable, 1);
+    }
+    return atlas_test_run("sem", TESTS, sizeof TESTS / sizeof TESTS[0]);
+}

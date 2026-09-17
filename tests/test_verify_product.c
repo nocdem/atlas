@@ -393,25 +393,11 @@ static void test_no_mcp_call_can_assert_truth_or_coverage(void) {
                                claim, FORGERIES[i]),
              &err);
         run_mcp(&e, atlas_buf_cstr(&script), &out, &err);
-        /* The guarantee is that the supplied value **reaches nothing**, not
-         * that the request is rejected.
-         *
-         * Every tool schema advertises `additionalProperties: false`, and the
-         * adapter additionally *ignores* any member a tool does not name —
-         * `run_verify_evaluate` reads `repo` and `claim` and nothing else. So a
-         * forged argument is not refused; it is not read. That is the same
-         * shape A9 gives the gateway's route table, where anything else in a
-         * query string is ignored rather than forwarded.
-         *
-         * Which means the assertion that matters is about the *answer*: the
-         * reply must still carry the truth and coverage Atlas derived from
-         * index state. This fixture has no semantic generation, so the only
-         * honest answer is UNKNOWN — and if a caller-supplied ABSENT or
-         * COMPLETE could ever reach the aggregation, it is here that it would
-         * show. */
-        T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "\"truth\":\"UNKNOWN\"") != NULL,
-                    "a model supplied %s and the reported truth was not the derived UNKNOWN; "
-                    "truth must come from index state, never from a caller: %s",
+        /* Undeclared authority fields are rejected before any evaluation.
+         * The clean call below independently proves derived UNKNOWN still works. */
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "\"code\":-32602") != NULL &&
+                    strstr(atlas_buf_cstr(&out), "not a recognised argument") != NULL,
+                    "a model supplied %s and the call was not rejected at the schema boundary: %s",
                     FORGERIES[i], atlas_buf_cstr(&out));
         T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "\"truth\":\"ABSENT\"") == NULL,
                     "a model supplied %s and Atlas reported ABSENT: %s", FORGERIES[i],
@@ -439,8 +425,8 @@ static void test_no_mcp_call_can_assert_truth_or_coverage(void) {
         /* And what comes back carries the truth axis, so a model reading over
          * the transport sees UNKNOWN rather than inferring a negative from a
          * verifier verdict it would have to invert by hand. */
-        T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "truth") != NULL,
-                    "the MCP reply carried no truth axis: %s", atlas_buf_cstr(&out));
+        T_CHECK_MSG(strstr(atlas_buf_cstr(&out), "\"truth\":\"UNKNOWN\"") != NULL,
+                    "the clean MCP call did not derive UNKNOWN: %s", atlas_buf_cstr(&out));
         atlas_buf_free(&script);
     }
 

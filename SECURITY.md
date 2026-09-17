@@ -8,20 +8,27 @@ and its own `.git/config` are all attacker-controlled in the worst case. Atlas i
 designed so that indexing a hostile repository cannot lead to code execution,
 reads outside the repository, unbounded resource use, or corruption of the index.
 
-Atlas is a local, single-user tool. It opens no network sockets, listens on no
-port, and transmits nothing anywhere.
+The current deployment has distinct authority boundaries:
 
-**Since A1 it does have a daemon**, and that daemon listens — on a Unix-domain
-socket at `$XDG_RUNTIME_DIR/atlas/atlas.sock`, with mode 0600 inside a 0700
-directory, and refusing any peer whose `SO_PEERCRED` UID is not ours. There is
-no TCP socket and no network transport of any kind; the systemd unit sets
-`PrivateNetwork=yes` and `IPAddressDeny=any`, so the absence of network access is
-enforced by the kernel rather than only asserted here.
+- The indexing daemon serves a local Unix socket. Peer identity comes from
+  `SO_PEERCRED`; system deployments separate scanner, daemon, operator and
+  gateway identities under root-owned policy. See
+  [OS separation](docs/security/A7_1_THREAT_MODEL.md).
+- The optional HTTP gateway opens a network listener for scoped remote MCP and
+  Mission Control. Selected write operations require explicitly named
+  credentials and daemon-side policy checks. See
+  [remote access](docs/remote-access.md).
+- Orchestration can start configured model workers, whose network and editing
+  capabilities depend on the driver and deployment policy. See
+  [orchestration](docs/orchestration.md).
+- An optional external deploy agent applies a stored patch only after a
+  separate credential confirms it. Its commands and target come from a
+  root-owned configuration. See [remote deploy](docs/remote-deploy.md).
 
-The daemon's attack surface is one local socket reachable only by the same user.
-Its protocol is length-framed with a hard size ceiling checked before any payload
-is read, bounded nesting depth, deadlines on both directions, and no remotely
-callable shutdown. See [docs/daemon-and-ipc.md](docs/daemon-and-ipc.md).
+The local IPC protocol is length-framed, with a hard size ceiling, bounded
+nesting and deadlines. Enabling indexing alone grants neither worker editing
+nor remote deployment. Historical phase-specific sections below describe their
+original scope; they do not remove later capabilities listed here.
 
 **Since A2 it talks to a language model**, through two adapters that are both
 clients of that same socket. Neither holds a database handle, neither creates a
@@ -646,5 +653,4 @@ this project, and please include:
 - what you expected Atlas to do instead
 
 Please do not open a public issue for a vulnerability before it is fixed.
-
 

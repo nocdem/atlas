@@ -4609,6 +4609,154 @@ atlas_status atlas_db_orch_artifacts(atlas_db *db, const char *job_uid, int64_t 
     return s;
 }
 
+/* --- A14R-F: the ledger rows a remote failure read returns --------------------
+ *
+ * Three readers, each the shape of `atlas_db_orch_artifacts` above: joined to
+ * `orch_jobs` on the public uid, borrowed rows, no write. The caller's right to
+ * see the job is checked before any of them is called. */
+
+atlas_status atlas_db_orch_job_attempts(atlas_db *db, const char *job_uid,
+                                        atlas_orch_attempt_cb cb, void *ud, atlas_err *err) {
+    static const char SQL[] =
+        "SELECT a.attempt_no, a.state, a.driver, a.driver_version, a.exit_kind, a.exit_code,"
+        "       a.failure_reason, a.event_count, a.artifact_count, a.started_at, a.ended_at,"
+        "       a.dispatcher_id"
+        "  FROM orch_attempts a"
+        "  JOIN orch_jobs j ON j.id = a.job_id"
+        " WHERE j.job_uid = ?1"
+        " ORDER BY a.attempt_no LIMIT ?2;";
+    sqlite3_stmt *st = NULL;
+    atlas_status s = atlas_db_prepare(db, SQL, &st, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    s = atlas_db_bind_text_opt(db, st, 1, job_uid, err);
+    if (s != ATLAS_OK) {
+        atlas_db_finish(db, st);
+        return s;
+    }
+    (void)sqlite3_bind_int64(st, 2, ATLAS_ORCH_MAX_ATTEMPTS);
+    while (s == ATLAS_OK && sqlite3_step(st) == SQLITE_ROW) {
+        atlas_orch_attempt_row row;
+        memset(&row, 0, sizeof(row));
+        row.attempt_no = sqlite3_column_int64(st, 0);
+        row.state = atlas_db_col_text(st, 1);
+        row.driver = atlas_db_col_text(st, 2);
+        row.driver_version = atlas_db_col_text(st, 3);
+        row.exit_kind = atlas_db_col_text(st, 4);
+        row.exit_code = sqlite3_column_int64(st, 5);
+        row.failure_reason = atlas_db_col_text(st, 6);
+        row.event_count = sqlite3_column_int64(st, 7);
+        row.artifact_count = sqlite3_column_int64(st, 8);
+        row.started_at = atlas_db_col_text(st, 9);
+        row.ended_at = atlas_db_col_text_opt(st, 10);
+        row.dispatcher_id = atlas_db_col_text(st, 11);
+        if (cb != NULL) {
+            s = cb(&row, ud, err);
+        }
+    }
+    atlas_db_finish(db, st);
+    return s;
+}
+
+atlas_status atlas_db_orch_job_transitions(atlas_db *db, const char *job_uid,
+                                           atlas_orch_transition_cb cb, void *ud,
+                                           atlas_err *err) {
+    /* LEFT JOIN: a submission transition names no attempt. The bound is the
+     * ledger's own — a job writes a handful of rows per attempt and attempts
+     * are bounded — but a LIMIT is stated so a corrupt ledger cannot make one
+     * read unbounded. */
+    static const char SQL[] =
+        "SELECT t.id, COALESCE(a.attempt_no, 0), t.from_state, t.to_state, t.reason, t.actor,"
+        "       t.detail, t.at"
+        "  FROM orch_transitions t"
+        "  JOIN orch_jobs j ON j.id = t.job_id"
+        "  LEFT JOIN orch_attempts a ON a.id = t.attempt_id"
+        " WHERE j.job_uid = ?1"
+        " ORDER BY t.id LIMIT ?2;";
+    sqlite3_stmt *st = NULL;
+    atlas_status s = atlas_db_prepare(db, SQL, &st, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    s = atlas_db_bind_text_opt(db, st, 1, job_uid, err);
+    if (s != ATLAS_OK) {
+        atlas_db_finish(db, st);
+        return s;
+    }
+    (void)sqlite3_bind_int64(st, 2, (int64_t)ATLAS_ORCH_MAX_ATTEMPTS * 16);
+    while (s == ATLAS_OK && sqlite3_step(st) == SQLITE_ROW) {
+        atlas_orch_transition_row row;
+        memset(&row, 0, sizeof(row));
+        row.id = sqlite3_column_int64(st, 0);
+        row.attempt_no = sqlite3_column_int64(st, 1);
+        row.from_state = atlas_db_col_text(st, 2);
+        row.to_state = atlas_db_col_text(st, 3);
+        row.reason = atlas_db_col_text(st, 4);
+        row.actor = atlas_db_col_text(st, 5);
+        row.detail = atlas_db_col_text(st, 6);
+        row.at = atlas_db_col_text(st, 7);
+        if (cb != NULL) {
+            s = cb(&row, ud, err);
+        }
+    }
+    atlas_db_finish(db, st);
+    return s;
+}
+
+atlas_status atlas_db_orch_job_events(atlas_db *db, const char *job_uid, const char *kind,
+                                      int64_t limit, atlas_orch_event_cb cb, void *ud,
+                                      atlas_err *err) {
+    /* Newest `limit` rows selected by the inner query, then re-ordered oldest
+     * first, so a caller reads a narrative that ends where the attempt ended. */
+    static const char SQL[] =
+        "SELECT attempt_no, seq, kind, payload, at FROM ("
+        "  SELECT e.id AS id, a.attempt_no AS attempt_no, e.seq AS seq, e.kind AS kind,"
+        "         e.payload AS payload, e.at AS at"
+        "    FROM orch_events e"
+        "    JOIN orch_jobs j ON j.id = e.job_id"
+        "    JOIN orch_attempts a ON a.id = e.attempt_id"
+        "   WHERE j.job_uid = ?1 AND (?2 = '' OR e.kind = ?2)"
+        "   ORDER BY e.id DESC LIMIT ?3"
+        ") ORDER BY id;";
+    if (limit <= 0 || limit > ATLAS_ORCH_MAX_EVENTS) {
+        limit = ATLAS_ORCH_MAX_EVENTS;
+    }
+    sqlite3_stmt *st = NULL;
+    atlas_status s = atlas_db_prepare(db, SQL, &st, err);
+    if (s != ATLAS_OK) {
+        return s;
+    }
+    s = atlas_db_bind_text_opt(db, st, 1, job_uid, err);
+    if (s == ATLAS_OK) {
+        s = atlas_db_bind_text_opt(db, st, 2, kind != NULL ? kind : "", err);
+    }
+    if (s != ATLAS_OK) {
+        atlas_db_finish(db, st);
+        return s;
+    }
+    (void)sqlite3_bind_int64(st, 3, limit);
+    while (s == ATLAS_OK && sqlite3_step(st) == SQLITE_ROW) {
+        atlas_orch_event_row row;
+        memset(&row, 0, sizeof(row));
+        row.attempt_no = sqlite3_column_int64(st, 0);
+        row.seq = sqlite3_column_int64(st, 1);
+        row.kind = atlas_db_col_text(st, 2);
+        /* Exact bytes: the payload is TEXT but a worker's bytes are bytes, and
+         * `sqlite3_column_text` would hand back the same pointer with a NUL
+         * appended — the length is what makes an embedded NUL survive. */
+        row.payload = sqlite3_column_blob(st, 3);
+        int len = sqlite3_column_bytes(st, 3);
+        row.payload_len = len > 0 ? (size_t)len : 0u;
+        row.at = atlas_db_col_text(st, 4);
+        if (cb != NULL) {
+            s = cb(&row, ud, err);
+        }
+    }
+    atlas_db_finish(db, st);
+    return s;
+}
+
 /* --- A8: the snapshot manifest ------------------------------------------------
  *
  * Everything an attempt is entitled to receive, resolved from persisted state.

@@ -438,8 +438,12 @@ static void test_documented_tool_names_are_plugin_scoped_correctly(void) {
      * none may: disposing of a proposed deploy is the operator's own decision,
      * taken through `remote_deploy_key` and a dedicated route, never an MCP
      * call. The two write tools (`atlas_deploy_propose` and
-     * `atlas_deploy_cancel`) extend the same invariant the A14 pair does. */
-    T_CHECK_MSG(n == 46, "expected 46 tools, found %zu", n);
+     * `atlas_deploy_cancel`) extend the same invariant the A14 pair does.
+     *
+     * A14R-F added `atlas_job_failure`, on `atlas_job_result`'s terms exactly:
+     * remote-only, `ATLAS_SCOPE_JOBS_SUBMIT`, `writes = false`. It reads why a
+     * job did not succeed and starts, applies and approves nothing. */
+    T_CHECK_MSG(n == 47, "expected 47 tools, found %zu", n);
 }
 
 /* --- the integration record ----------------------------------------------

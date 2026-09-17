@@ -1317,6 +1317,8 @@ atlas_status atlas_sem_trace(atlas_db *db, int64_t generation_id, const char *fr
 #define ATLAS_SEM_SEL_TYPE "is a type the subject uses"
 #define ATLAS_SEM_SEL_TEST_BY_REFERENCE "a test file that references the subject"
 #define ATLAS_SEM_SEL_TEST_BY_NAME "a test file whose name resembles the subject"
+#define ATLAS_SEM_SEL_TEST_TRANSITIVE "a test file that reaches the subject through calls"
+#define ATLAS_SEM_SEL_TEST_RECORD "a recorded test names this file or symbol (historical evidence)"
 /* A9.1 corrected this literal. It said "an approved Atlas decision anchored near
  * the subject", which was accurate for nothing: A8-CI never produced an item
  * carrying it, and A9.1's items may be any knowledge kind and — with
@@ -1325,12 +1327,13 @@ atlas_status atlas_sem_trace(atlas_db *db, int64_t generation_id, const char *fr
  * what it is, is in `knowledge_kind` and `knowledge_status`. */
 #define ATLAS_SEM_SEL_DECISION "a recorded knowledge record whose links name a file in scope"
 #define ATLAS_SEM_SEL_SUBJECT "the subject itself"
+#define ATLAS_SEM_SEL_TASK_MATCH "symbol name matches a task term (lexical selection)"
 bool atlas_sem_selection_reason_is_known(const char *reason);
 const char *atlas_sem_selection_reason_intern(const char *reason);
 
 /* One selected item, whatever selected it. */
 typedef struct atlas_sem_item {
-    /* "symbol", "file", "decision". */
+    /* "symbol", "file", "decision", "test". */
     char kind[16];
     char name[ATLAS_SEM_MAX_NAME_BYTES];
     char file_text[512];
@@ -1371,6 +1374,14 @@ typedef struct atlas_sem_item {
     /* One of the fixed selection reasons above. */
     const char *why;
     int64_t depth;
+    /* Test classification is separate from graph evidence. Recorded results
+     * are historical attestations, even at the same commit; never a new pass. */
+    char test_classification[24];
+    char test_suite[96];
+    char test_target[160];
+    char test_result[32];
+    char test_commit[65];
+    char test_evidence_uid[64];
 } atlas_sem_item;
 
 typedef struct atlas_sem_impact_report {
@@ -1429,7 +1440,7 @@ typedef struct atlas_sem_context_req {
      * as bytes, because bytes are what Atlas can count. */
     int64_t max_tokens;
     int64_t max_bytes;
-    int64_t max_items;
+    int64_t max_items; /* zero selects ATLAS_SEM_CONTEXT_DEFAULT_ITEMS */
     /* Include superseded and rejected decision history. Off by default:
      * rejected prose is not current authority and must not read as though it
      * were. */
@@ -1437,6 +1448,13 @@ typedef struct atlas_sem_context_req {
 } atlas_sem_context_req;
 
 void atlas_sem_context_req_init(atlas_sem_context_req *r);
+
+typedef struct atlas_sem_context_scope {
+    char path[512];
+    bool in_file_index;
+    int64_t units;
+    int64_t complete_units;
+} atlas_sem_context_scope;
 
 typedef struct atlas_sem_context_report {
     atlas_repo_info repo;
@@ -1455,17 +1473,30 @@ typedef struct atlas_sem_context_report {
     bool budget_reached;
     /* What Atlas could not supply, so the package states its own gaps rather
      * than reading as complete. Fixed strings. */
-    const char *missing[8];
+    const char *missing[ATLAS_SEM_CONTEXT_MAX_GAPS];
     size_t missing_count;
+    atlas_sem_context_scope scope[ATLAS_SEM_CONTEXT_MAX_SCOPE];
+    size_t scope_count;
+    bool scope_truncated;
+    const char *next_steps[ATLAS_SEM_CONTEXT_MAX_GAPS];
+    size_t next_step_count;
 } atlas_sem_context_report;
 
 void atlas_sem_context_report_init(atlas_sem_context_report *r);
 void atlas_sem_context_report_free(atlas_sem_context_report *r);
+const char *atlas_sem_context_advice_intern(const char *text);
+atlas_status atlas_sem_context_guidance_write_json(atlas_json *j,
+    const atlas_sem_context_report *r, atlas_err *err);
 
 #define ATLAS_SEM_MISSING_INDEX "no semantic index exists for this repository"
 #define ATLAS_SEM_MISSING_STALE "the semantic index does not describe the current commit"
 #define ATLAS_SEM_MISSING_SEEDS "no starting path or symbol matched the task"
 #define ATLAS_SEM_MISSING_BUDGET "the byte budget was reached before every item was included"
+#define ATLAS_SEM_MISSING_ITEMS "the item limit was reached before every item was included"
+#define ATLAS_SEM_MISSING_SEARCH "the task seed search reached its candidate or term limit"
+#define ATLAS_SEM_MISSING_GRAPH "a seed's graph expansion was incomplete"
+#define ATLAS_SEM_MISSING_KNOWLEDGE "some knowledge anchors or records could not be included"
+#define ATLAS_SEM_MISSING_TESTS "test target and result coverage is incomplete; candidates are not an exhaustive test plan"
 #define ATLAS_SEM_MISSING_DECISIONS "no recorded knowledge was found for the files in scope"
 /* A9.2.5. The package could not state its own coverage gaps.
  *

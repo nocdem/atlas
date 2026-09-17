@@ -165,6 +165,10 @@ atlas_status atlas_db_sem_config_forget_repo(atlas_db *db, int64_t repo_id, atla
 atlas_status atlas_db_sem_scope_counts(atlas_db *db, int64_t repo_id, int64_t generation_id,
                                        int64_t *candidates_out, int64_t *covered_out,
                                        atlas_err *err);
+/* File presence and translation-unit outcomes, not whole-program coverage.
+ * Headers may have no unit of their own even when included by indexed code. */
+atlas_status atlas_db_sem_context_scope(atlas_db *db, int64_t repo_id, int64_t generation_id,
+    const char *path, atlas_sem_context_scope *out, atlas_err *err);
 
 /* Classifies this generation's units against the operator's declared test roots.
  * With no roots declared both counts are zero and `known_out` is false, which is
@@ -391,6 +395,15 @@ atlas_status atlas_db_sem_symbols_by_name(atlas_db *db, int64_t generation_id, c
                                           const char *usr, const char *kind, int64_t limit,
                                           atlas_sem_symbol_cb cb, void *ud, int64_t *total_out,
                                           bool *truncated_out, atlas_err *err);
+
+/* Literal, case-insensitive identifier prefix/component matches. No wildcard
+ * syntax. Repository definitions first; this is lexical selection, never
+ * proof that a symbol is the task's intended subject. */
+atlas_status atlas_db_sem_symbols_matching(atlas_db *db, int64_t generation_id,
+                                           const char *term, int64_t limit,
+                                           atlas_sem_symbol_cb cb, void *ud,
+                                           int64_t *total_out, bool *truncated_out,
+                                           atlas_err *err);
 
 /* Symbols declared or defined in one repository-relative file. */
 atlas_status atlas_db_sem_symbols_in_file(atlas_db *db, int64_t generation_id,

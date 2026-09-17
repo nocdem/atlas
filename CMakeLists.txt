@@ -19,6 +19,7 @@ option(ATLAS_UBSAN "Build with UndefinedBehaviorSanitizer" OFF)
 option(ATLAS_TSAN "Build with ThreadSanitizer" OFF)
 option(ATLAS_WERROR "Treat warnings in first-party code as errors" ON)
 option(ATLAS_BUILD_TESTS "Build the test suite" ON)
+option(ATLAS_WITH_LIBCLANG "Enable compiler-aware semantics when system libclang is available" ON)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -48,6 +49,7 @@ message(STATUS "Atlas: SQLite3 ${SQLITE3_VERSION} via pkg-config")
 # Nothing is downloaded. This locates a library that is already installed, the
 # same way SQLite3 is located.
 set(ATLAS_LIBCLANG_ROOT "" CACHE PATH "Directory holding clang-c/Index.h and libclang")
+if(ATLAS_WITH_LIBCLANG)
 find_path(ATLAS_LIBCLANG_INCLUDE_DIR clang-c/Index.h
   HINTS ${ATLAS_LIBCLANG_ROOT}/include
   PATHS /usr/lib/llvm-19/include /usr/lib/llvm-18/include /usr/lib/llvm-17/include
@@ -57,11 +59,15 @@ find_library(ATLAS_LIBCLANG_LIBRARY NAMES clang libclang
   HINTS ${ATLAS_LIBCLANG_ROOT}/lib
   PATHS /usr/lib/llvm-19/lib /usr/lib/llvm-18/lib /usr/lib/llvm-17/lib
         /usr/lib/llvm-16/lib /usr/lib/llvm-15/lib /usr/lib/llvm-14/lib)
+endif()
 
-if(ATLAS_LIBCLANG_INCLUDE_DIR AND ATLAS_LIBCLANG_LIBRARY)
+if(ATLAS_WITH_LIBCLANG AND ATLAS_LIBCLANG_INCLUDE_DIR AND ATLAS_LIBCLANG_LIBRARY)
   set(ATLAS_HAVE_LIBCLANG ON)
   message(STATUS "Atlas: libclang ${ATLAS_LIBCLANG_LIBRARY}")
   message(STATUS "Atlas: libclang headers ${ATLAS_LIBCLANG_INCLUDE_DIR}")
+elseif(NOT ATLAS_WITH_LIBCLANG)
+  set(ATLAS_HAVE_LIBCLANG OFF)
+  message(STATUS "Atlas: compiler-aware semantics explicitly disabled (ATLAS_WITH_LIBCLANG=OFF)")
 else()
   set(ATLAS_HAVE_LIBCLANG OFF)
   message(WARNING
@@ -182,6 +188,15 @@ add_library(atlas_core STATIC
   src/git/git_parse.c
   src/output/json.c
   src/cli/cli.c
+  src/cli/cli_args.c
+  src/cli/cli_common.c
+  src/cli/cli_daemon.c
+  src/cli/cli_decision.c
+  src/cli/cli_remote.c
+  src/cli/cli_memory.c
+  src/cli/cli_code.c
+  src/cli/cli_jobs.c
+  src/cli/cli_dispatch.c
   src/cli/render_human.c
   src/cli/render_json.c
   # --- A1: locking, IPC, daemon, watcher --------------------------------
@@ -213,6 +228,15 @@ add_library(atlas_core STATIC
   src/hook/hook.c
   src/mcp/mcp.c
   src/mcp/mcp_tools.c
+  src/mcp/mcp_tools_common.c
+  src/mcp/mcp_tools_read.c
+  src/mcp/mcp_tools_code.c
+  src/mcp/mcp_tools_memory.c
+  src/mcp/mcp_tools_gate.c
+  src/mcp/mcp_tools_sem.c
+  src/mcp/mcp_tools_verify.c
+  src/mcp/mcp_tools_jobs.c
+  src/mcp/mcp_tools_deploy.c
   src/core/integrate.c
   src/core/service_code.c
   # --- A3: structural code intelligence ---------------------------------

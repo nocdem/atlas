@@ -1052,8 +1052,10 @@ candidate** — absent, never guessed.
    purpose is to measure the mechanism that is the conservative direction — a
    corpus already shaped by memory cannot measure memory — and it is the first
    thing to revisit if the answer turns out to be that memory helps.
-3. Score is the count of distinct shared tokens between the new task text and
-   the candidate's root task text, plus a commit-relation bonus. A token is at
+3. The `lexical-v2` score uses distinct shared tokens between the new task and
+   four historical fields: root goal (weight 1), declared gates (2), recorded
+   gate output (2), and stored patch path hints (3), plus a commit-relation
+   bonus. The rendered entry states the overlap for each field. A token is at
    least four bytes, lowercased, and `_`, `.`, `/` and `-` are inside a token
    rather than delimiters — so `src/orch/rundriver.c` stays one token, which is
    why a lexical rule works on this material at all.
@@ -1081,7 +1083,7 @@ failure.
 Per selected run: the run uid, its terminal status, its source commit and
 relation, the worker-start and task counts, the root task's goal, the declared
 gates, the last attempt's terminal reason and failed gate index, a bounded
-excerpt of what the failing gate printed, changed paths when a run recorded any,
+excerpt of recorded gate output, patch path hints when a run retained any,
 and the usage summary.
 
 Absent counts print as `?`, never as zero: a run whose usage was never observed
@@ -1089,8 +1091,15 @@ did not cost nothing.
 
 **`worker.log` is never read.** It is the whole streamed transcript — prompts,
 tool arguments, model prose — and none of that may enter a package. `gate.log`
-is the output of a compiler or a test runner over a tree, which is the one piece
-of evidence about a past failure that is both bounded and useful.
+is labeled untrusted historical output: its presence does not establish a
+failed result. Only the last stored inline `changes.patch` artifact is inspected
+for path hints, with a 256 KiB scan limit, 64 paths and a 320-byte retained field.
+File headers are parsed without executing the patch; hunks are excluded.
+Malformed, binary, rename-only, mode-only or oversized patches disclose
+incomplete hints. Paths do not prove the patch was applied or deployed.
+
+The selection change applies when new packages are frozen. Existing packages,
+their digests, the OFF mode and the run eligibility rules remain unchanged.
 
 There is deliberately **no member** of `atlas_orch_memory_cand` for a prompt, a
 session identifier, a tool argument, a credential, a diff or a log. The

@@ -28,9 +28,15 @@
  * socket, a real database or a registered repository.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "atlas/sem.h"
+#include "atlas/datadir.h"
+#include "atlas/db.h"
+#include "atlas/verify.h"
+#include "atlas/ipc.h"
+#include "mcp/mcp_internal.h"
 #include "atlas_test.h"
 #include "support/fixture.h"
 
@@ -851,6 +857,61 @@ static void test_e2e_a_repository_with_no_index_still_carries_the_block(void) {
     e2e_close(&E);
 }
 
+static void check_context_mcp(fx_daemon *d, atlas_err *err) {
+    static const char *const args[] = {
+        "{\"task\":\"Bağlam sıralamasını iyileştir\",\"paths\":[\"src/lib.c\"]}",
+        "{\"task\":\"unrelatedzz\",\"symbols\":[\"orphan\"]}",
+        "{\"task\":\"orphan\",\"paths\":42}",
+        "{\"task\":\"orphan\",\"paths\":[\"../escape.c\"]}",
+        "{\"task\":\"orphan\",\"symbols\":[\"bad\\u0000name\"]}",
+    };
+    for (size_t i = 0; i < sizeof args / sizeof args[0]; i++) {
+        atlas_buf request = ATLAS_BUF_INIT;
+        T_OK(atlas_buf_appendf(&request, err,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{"
+            "\"name\":\"atlas_context_build\",\"arguments\":%s}}", args[i]), err);
+        char *bytes = NULL;
+        size_t len = 0;
+        FILE *mem = open_memstream(&bytes, &len);
+        T_REQUIRE(mem != NULL);
+        atlas_mcp_opts opts;
+        atlas_mcp_opts_init(&opts);
+        opts.socket_path = atlas_buf_cstr(&d->socket);
+        atlas_mcp_server server;
+        atlas_mcp_server_init(&server, NULL, mem, NULL, &opts);
+        server.remote = true;
+        server.granted = UINT32_MAX;
+        T_OK(atlas_mcp_handle_document(&server, request.data, request.len, err), err);
+        atlas_mcp_server_teardown(&server);
+        T_REQUIRE(fclose(mem) == 0);
+        atlas_jsondoc *doc = NULL;
+        T_OK(atlas_jsondoc_parse(bytes, len, ATLAS_MCP_MAX_RESULT_BYTES, 64, &doc, err), err);
+        const atlas_jsonv *result = atlas_jsonv_get(atlas_jsondoc_root(doc), "result");
+        bool failed = false;
+        (void)atlas_jsonv_bool(atlas_jsonv_get(result, "isError"), &failed);
+        T_CHECK_MSG(failed == (i >= 2), "MCP context case %zu: %s", i, bytes);
+        if (i < 2) {
+            T_CHECK(strstr(bytes, "orphan") != NULL);
+            T_CHECK(strstr(bytes, "test_orphan") != NULL);
+            T_CHECK(strstr(bytes, "test_result_historical") != NULL);
+        }
+        atlas_jsondoc_free(doc);
+        free(bytes);
+        atlas_buf_free(&request);
+    }
+    const char *bad[] = {"{\"repo\":\"fixture\",\"task\":\"orphan\",\"paths\":42}",
+                        "{\"repo\":\"fixture\",\"task\":\"orphan\",\"symbols\":[false]}"};
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        atlas_buf raw = ATLAS_BUF_INIT;
+        T_OK(atlas_ipc_call(atlas_buf_cstr(&d->socket), "sem.context", bad[i], &raw, err), err);
+        atlas_ipc_response *response = NULL;
+        T_OK(atlas_ipc_response_parse(raw.data, raw.len, &response, err), err);
+        T_CHECK(!atlas_ipc_response_ok(response));
+        atlas_ipc_response_free(response);
+        atlas_buf_free(&raw);
+    }
+}
+
 static void test_rpc_answers_exactly_as_the_local_path_does(void) {
     /* **The surface the local tests structurally cannot see.**
      *
@@ -872,10 +933,55 @@ static void test_rpc_answers_exactly_as_the_local_path_does(void) {
     e2e E;
     e2e_open(&E, &err);
 
+    atlas_buf db_path = ATLAS_BUF_INIT;
+    T_OK(atlas_datadir_db_path(fx_data_dir(&E.fx), &db_path, &err), &err);
+    atlas_db *db = NULL;
+    T_OK(atlas_db_open(atlas_buf_cstr(&db_path), &db, &err), &err);
+    atlas_repo_info repo;
+    atlas_repo_info_init(&repo);
+    bool found = false;
+    T_OK(atlas_db_repo_get(db, "fixture", &repo, &found, &err), &err);
+    T_REQUIRE(found);
+    atlas_verify_evidence ev;
+    atlas_verify_evidence_init(&ev);
+    ev.cls = ATLAS_EVIDENCE_TEST;
+    ev.repo_id = repo.id;
+    T_OK(atlas_buf_set_str(&ev.path_raw, "src/lib.c", &err), &err);
+    T_OK(atlas_buf_set_str(&ev.path_text, "src/lib.c", &err), &err);
+    T_OK(atlas_buf_set_str(&ev.symbol, "orphan", &err), &err);
+    T_OK(atlas_buf_set_str(&ev.suite, "ctest", &err), &err);
+    T_OK(atlas_buf_set_str(&ev.test_name, "test_orphan", &err), &err);
+    T_OK(atlas_buf_set_str(&ev.result, "PASS", &err), &err);
+    T_OK(atlas_db_verify_evidence_insert(db, &ev, "2026-09-18T00:00:00Z", &err), &err);
+    atlas_verify_evidence_free(&ev);
+    atlas_repo_info_free(&repo);
+    atlas_db_close(db);
+    atlas_buf_free(&db_path);
+
     fx_daemon d;
     fx_daemon_init(&d);
     T_OK(fx_daemon_start(&E.fx, &d, &err), &err);
     T_OK(fx_daemon_wait_ready(&d, 30000, &err), &err);
+
+    check_context_mcp(&d, &err);
+    const char *context_args[] = {"context", "build", "--repo", "fixture", "--task", "unrelatedzz",
+                                  "--path", "src/lib.c", "--json"};
+    atlas_buf context_rpc = ATLAS_BUF_INIT;
+    run_ok(&E, context_args, 9, &context_rpc, &err);
+    T_CHECK(has(&context_rpc, "orphan"));
+    T_CHECK(has(&context_rpc, "\"scope\":[{\"path\":\"src/lib.c\""));
+    T_CHECK(has(&context_rpc, "\"complete_units\":1"));
+    T_CHECK(has(&context_rpc, "Read atlas_sem_status"));
+    T_CHECK(has(&context_rpc, "\"test_target\":\"test_orphan\""));
+    T_CHECK(has(&context_rpc, "\"test_result_historical\":true"));
+    const char *gap_args[] = {"context", "build", "--repo", "fixture", "--task", "unrelatedzz",
+                              "--path", "nodus/tests/deep.c", "--json"};
+    atlas_buf gap = ATLAS_BUF_INIT;
+    run_ok(&E, gap_args, 9, &gap, &err);
+    T_CHECK(has(&gap, "\"path\":\"nodus/tests/deep.c\",\"in_file_index\":true,\"units\":0"));
+    T_CHECK(has(&gap, "zero translation units does not prove a file is absent"));
+    T_CHECK(has(&gap, "\"result_verdict\":\"UNKNOWN\""));
+    atlas_buf_free(&gap);
 
     /* `deep_caller` lives in the file the compilation database does not name, so
      * this generation has never seen it. Locally that is UNKNOWN with a trust
@@ -911,6 +1017,17 @@ static void test_rpc_answers_exactly_as_the_local_path_does(void) {
     /* And the socket says exactly what the local path says, value by value. The
      * daemon is stopped for the local run so the CLI takes the writer path. */
     fx_daemon_stop(&d, false);
+    atlas_buf context_local = ATLAS_BUF_INIT;
+    run_ok(&E, context_args, 9, &context_local, &err);
+    T_CHECK(has(&context_local, "orphan"));
+    T_CHECK(has(&context_local, "\"scope\":[{\"path\":\"src/lib.c\""));
+    T_CHECK(has(&context_local, "\"test_target\":\"test_orphan\""));
+    T_CHECK(has(&context_local, "\"test_result_historical\":true"));
+    T_CHECK(has(&context_local, "\"complete_units\":1"));
+    T_CHECK(has(&context_local, "Read atlas_sem_status"));
+    check_same_trust_values(&context_local, &context_rpc, "context explicit path local vs socket");
+    atlas_buf_free(&context_local);
+    atlas_buf_free(&context_rpc);
     atlas_buf local_unknown = ATLAS_BUF_INIT;
     run_ok(&E, q2, 5u, &local_unknown, &err);
     check_same_trust_values(&local_unknown, &rpc_unknown, "callers orphan, local vs socket");

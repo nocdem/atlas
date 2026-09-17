@@ -2371,6 +2371,13 @@ static atlas_status j_sem_items(atlas_renderer *r, const atlas_sem_item *items, 
         TRY(atlas_json_key_str_opt(
             r->j, "why", atlas_sem_selection_reason_is_known(it->why) ? it->why : NULL, err));
         TRY(atlas_json_key_int(r->j, "depth", it->depth, err));
+        if (it->test_classification[0] != '\0') TRY(json_safe(r->j, &r->safe, "test_classification", it->test_classification, err));
+        if (it->test_suite[0] != '\0') TRY(json_safe(r->j, &r->safe, "test_suite", it->test_suite, err));
+        if (it->test_target[0] != '\0') TRY(json_safe(r->j, &r->safe, "test_target", it->test_target, err));
+        if (it->test_result[0] != '\0') TRY(json_safe(r->j, &r->safe, "test_result", it->test_result, err));
+        if (it->test_commit[0] != '\0') TRY(json_safe(r->j, &r->safe, "test_commit", it->test_commit, err));
+        if (it->test_evidence_uid[0] != '\0') TRY(json_safe(r->j, &r->safe, "test_evidence_uid", it->test_evidence_uid, err));
+        if (it->test_evidence_uid[0] != '\0') TRY(atlas_json_key_bool(r->j, "test_result_historical", true, err));
         TRY(atlas_json_obj_end(r->j, err));
     }
     return atlas_json_arr_end(r->j, err);
@@ -2415,6 +2422,7 @@ static atlas_status j_sem_context(atlas_renderer *r, const atlas_sem_context_rep
         TRY(atlas_json_str(r->j, rep->missing[i], err));
     }
     TRY(atlas_json_arr_end(r->j, err));
+    TRY(atlas_sem_context_guidance_write_json(r->j, rep, err));
     return j_sem_trust(r, &rep->trust, err);
 }
 

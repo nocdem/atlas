@@ -1086,6 +1086,8 @@ static void test_d_mcp_tool_calls(void) {
                "tools/list did not include atlas_job_cancel: %s", body_of(&resp));
     T_CHECK_MSG(strstr(body_of(&resp), "atlas_job_result") != NULL,
                "tools/list did not include atlas_job_result: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "atlas_job_failure") != NULL,
+               "tools/list did not include atlas_job_failure: %s", body_of(&resp));
     /* A14R. The annotations a client reads to decide whether a call needs
      * approval must say what is true of each tool. `atlas_job_result` reads and
      * `atlas_job_submit` starts a worker, so exactly one of them may be
@@ -1276,14 +1278,15 @@ static void test_d_mcp_tool_calls(void) {
 
     /* (d8) atlas_job_submit with an undeclared 'driver' argument → the schema
      * forbids additional properties, so the tool call is refused.  Assert
-     * isError and the absence of a job uid. */
+     * a protocol parameter error and the absence of a job uid. */
     http_request2(g, "POST", "/mcp", submit_bearer, NULL, NULL, "application/json",
                   "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":"
                   "{\"name\":\"atlas_job_submit\","
                   "\"arguments\":{\"repo\":\"proj\",\"task\":\"t\",\"key\":\"k\","
                   "\"driver\":\"attacker\"}}}",
                   (size_t)-1, &resp);
-    T_CHECK_MSG(strstr(body_of(&resp), "\"isError\":true") != NULL,
+    T_CHECK_MSG(strstr(body_of(&resp), "\"code\":-32602") != NULL &&
+               strstr(body_of(&resp), "not a recognised argument") != NULL,
                "atlas_job_submit with undeclared driver was not refused: %s", body_of(&resp));
     T_CHECK_MSG(strstr(body_of(&resp), "\\\"job\\\":\\\"j") == NULL,
                "refused atlas_job_submit still returned a job uid: %s", body_of(&resp));
@@ -1446,7 +1449,9 @@ static void test_e_result_of_a_dispatched_job(void) {
     T_CHECK_MSG(strstr(body_of(&resp), "report.txt") == NULL,
                 "an artifact outside the three names was returned: %s", body_of(&resp));
 
-    /* (e6) A worker's stdout log is not reachable here under any name. */
+    /* (e6) A worker's stdout log is not reachable *here* under any name. A14R-F
+     * carries a bounded tail of it through `job.remote_failure` and nowhere
+     * else; `test_g` asserts both halves of that on a long log. */
     T_CHECK_MSG(strstr(body_of(&resp), "fake driver ran for job") == NULL,
                 "a worker log leaked into the result: %s", body_of(&resp));
 
@@ -1587,6 +1592,225 @@ static void test_f_the_machine_wide_bound_and_the_unlimited_day(void) {
     env_close(&e);
 }
 
+
+/* --- A14R-F: job.remote_failure ----------------------------------------------
+ *
+ * The same chain `test_e` drives -- gateway submit, the shipped dispatcher in
+ * this process, the route a steward reaches -- for three attempts that do not
+ * succeed, one per way an attempt can fail short of a final answer:
+ *
+ *   A. the worker exits non-zero after writing a long log: the tail travels,
+ *      bounded and labelled truncated, and the head of the log does not;
+ *   B. the worker is cancelled and writes nothing: the absence is stated with
+ *      its reason, not left as an empty field;
+ *   C. the worker exits zero and a gate fails: the dispatcher's own record of
+ *      which gate and what it printed travels as the `failure` event.
+ *
+ * And the two properties that keep this a narrower channel than a log route:
+ * a second credential named by the same policy still reads "no such job", and
+ * `job.remote_result` still carries no worker log at all.
+ */
+static void test_g_failure_of_a_dispatched_job(void) {
+    env e;
+    env_open(&e);
+    atlas_err err;
+    atlas_err_init(&err);
+
+    char worker_root[4096];
+    (void)snprintf(worker_root, sizeof worker_root, "%s/worker", fx_data_dir(&e.fx));
+    T_REQUIRE(mkdir(worker_root, S_IRWXU) == 0 || errno == EEXIST);
+
+    /* `false` is on the gate allowlist, so a gate that fails is one line of
+     * policy rather than a fixture. */
+    char gw_policy[2048];
+    (void)snprintf(gw_policy, sizeof(gw_policy),
+                   "enabled = yes\ngateway_uid = %ld\nremote_mcp = yes\n"
+                   "web_gui = yes\nlisten_addr = 127.0.0.1\ntls_mode = REVERSE_PROXY\n"
+                   "remote_submit_key = %s\nremote_submit_key = %s\n"
+                   "remote_submit_driver = fake\nremote_submit_mode = patch\n"
+                   "remote_submit_max_attempts = 1\nremote_submit_max_active = 8\n"
+                   "remote_submit_max_per_day = 0\nremote_submit_gate = false\n",
+                   (long)getuid(), e.submit_id, e.second_id);
+    char orch_policy[5120];
+    (void)snprintf(orch_policy, sizeof(orch_policy),
+                   "dispatcher_uid = %ld\nsubmitter_uid = 2\n"
+                   "repo = proj\ndriver = fake\nmode = patch\nworker_root = %s\n",
+                   (long)getuid(), worker_root);
+    const char *gw_path = write_policy_file(&e, "gw.conf", gw_policy);
+    const char *orch_path = write_policy_file(&e, "orch.conf", orch_policy);
+
+    fx_daemon d;
+    fx_daemon_init(&d);
+    T_REQUIRE(gwd_start(&e, gw_path, orch_path, &d, &err) == ATLAS_OK);
+    T_OK(fx_daemon_wait_ready(&d, 15000, &err), &err);
+    atlas_gateway *g = NULL;
+    open_http_gateway(gw_policy, &d, &g);
+
+    char submit_bearer[ATLAS_APIKEY_TOKEN_MAX + 8u];
+    bearer_of(e.submit_token, submit_bearer, sizeof submit_bearer);
+    char second_bearer[ATLAS_APIKEY_TOKEN_MAX + 8u];
+    bearer_of(e.second_token, second_bearer, sizeof second_bearer);
+
+    /* A: a task long enough that the log the fake driver echoes it into is
+     * well past ATLAS_ORCH_LOG_TAIL_MAX. */
+    static char body_a[ATLAS_ORCH_LOG_TAIL_MAX * 2u + 256u];
+    {
+        size_t n = (size_t)snprintf(body_a, sizeof body_a, "repo=proj&task=fake%%3Afail+");
+        size_t fill = ATLAS_ORCH_LOG_TAIL_MAX + 2048u;
+        memset(body_a + n, 'x', fill);
+        n += fill;
+        (void)snprintf(body_a + n, sizeof body_a - n, "&key=g1");
+    }
+    atlas_buf resp = ATLAS_BUF_INIT;
+    atlas_buf job_a = ATLAS_BUF_INIT, job_b = ATLAS_BUF_INIT, job_c = ATLAS_BUF_INIT;
+    post_form(g, "/api/v1/job/submit", submit_bearer, body_a, &resp);
+    T_REQUIRE_MSG(status_of(&resp) == 200, "submit A: %d %s", status_of(&resp), body_of(&resp));
+    T_REQUIRE_MSG(get_field(&resp, "job", &job_a), "no job field: %s", body_of(&resp));
+    atlas_buf_reset(&resp);
+    post_form(g, "/api/v1/job/submit", submit_bearer, "repo=proj&task=fake%3Acancel&key=g2", &resp);
+    T_REQUIRE_MSG(status_of(&resp) == 200, "submit B: %d %s", status_of(&resp), body_of(&resp));
+    T_REQUIRE_MSG(get_field(&resp, "job", &job_b), "no job field: %s", body_of(&resp));
+    atlas_buf_reset(&resp);
+    post_form(g, "/api/v1/job/submit", submit_bearer, "repo=proj&task=make+a+change&key=g3", &resp);
+    T_REQUIRE_MSG(status_of(&resp) == 200, "submit C: %d %s", status_of(&resp), body_of(&resp));
+    T_REQUIRE_MSG(get_field(&resp, "job", &job_c), "no job field: %s", body_of(&resp));
+
+    char form_a[256], form_b[256], form_c[256];
+    (void)snprintf(form_a, sizeof form_a, "job=%s", atlas_buf_cstr(&job_a));
+    (void)snprintf(form_b, sizeof form_b, "job=%s", atlas_buf_cstr(&job_b));
+    (void)snprintf(form_c, sizeof form_c, "job=%s", atlas_buf_cstr(&job_c));
+
+    /* (g0) A queued job answers, with no attempt and the absence stated. This
+     * is the case the method exists for -- a job nobody ever carried is
+     * exactly the one a steward asks "why" about. */
+    atlas_buf_reset(&resp);
+    post_form(g, "/api/v1/job/failure", submit_bearer, form_a, &resp);
+    T_REQUIRE_MSG(status_of(&resp) == 200, "failure on a queued job: %d %s", status_of(&resp),
+                  body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "\"availability\":\"not_terminal\"") != NULL,
+                "a queued job did not answer not_terminal: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "\"attempts\":[]") != NULL,
+                "a queued job did not answer with an empty attempt list: %s", body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "never reached an attempt") != NULL,
+                "a queued job's absent log carried no reason: %s", body_of(&resp));
+
+    /* (g1) Another credential named by the same policy reads "no such job". */
+    atlas_buf_reset(&resp);
+    post_form(g, "/api/v1/job/failure", second_bearer, form_a, &resp);
+    T_CHECK_MSG(status_of(&resp) != 200 && strstr(body_of(&resp), "no such job") != NULL,
+                "a second credential read another key's failure: %d %s", status_of(&resp),
+                body_of(&resp));
+
+    /* Carry all three with the shipped dispatcher. */
+    {
+        atlas_dispatch_opts o;
+        memset(&o, 0, sizeof(o));
+        o.socket_path = atlas_buf_cstr(&d.socket);
+        o.worker_root = worker_root;
+        o.dispatcher_id = "atlas-gw-failure-test";
+        o.drivers = "fake";
+        o.heartbeat_ms = ATLAS_ORCH_LEASE_MS / 4;
+        const atlas_buf *jobs[3] = {&job_a, &job_b, &job_c};
+        for (size_t i = 0; i < 3; i++) {
+            bool ran = false;
+            T_OK(atlas_dispatch_run_one(&o, atlas_buf_cstr(jobs[i]), &ran, &err), &err);
+            T_REQUIRE_MSG(ran, "the dispatcher was not granted job %zu", i);
+        }
+    }
+
+    /* (g2) A: a tail, not the file. */
+    atlas_buf_reset(&resp);
+    post_form(g, "/api/v1/job/failure", submit_bearer, form_a, &resp);
+    T_REQUIRE_MSG(status_of(&resp) == 200, "failure A: %d %s", status_of(&resp), body_of(&resp));
+    const char *b = body_of(&resp);
+    T_CHECK_MSG(strstr(b, "\"state\":\"FAILED\"") != NULL, "A did not fail: %s", b);
+    T_CHECK_MSG(strstr(b, "\"exit_kind\":\"NONZERO\"") != NULL && strstr(b, "\"exit_code\":1") != NULL,
+                "A's attempt row does not carry the exit classification: %s", b);
+    T_CHECK_MSG(strstr(b, "\"cause\":\"attempt 1 ended FAILED: the worker exited NONZERO (code 1)") !=
+                    NULL,
+                "A's cause line is not composed from the attempt: %s", b);
+    const char *so = strstr(b, "\"stdout\":{");
+    T_REQUIRE_MSG(so != NULL, "no stdout block: %s", b);
+    T_CHECK_MSG(strncmp(so, "\"stdout\":{\"available\":true", 26) == 0,
+                "A's stdout tail is not available: %s", b);
+    T_CHECK_MSG(strstr(so, "\"truncated\":true") != NULL, "A's tail is not labelled truncated: %s",
+                b);
+    T_CHECK_MSG(strstr(so, "\"provenance\":\"UNTRUSTED_DATA\"") != NULL &&
+                    strstr(so, "\"encoding\":\"atlas-safe-1\"") != NULL,
+                "A's tail is not labelled and encoded: %s", b);
+    T_CHECK_MSG(strstr(so, "xxxxxxxx") != NULL, "A's tail does not carry the log's bytes: %s", b);
+    /* The head of the log is the proof it is a tail: the fake driver's first
+     * line is before the bound and must not be here. */
+    T_CHECK_MSG(strstr(b, "fake driver ran for job") == NULL,
+                "the head of the log travelled, so this is the file and not a tail: %s", b);
+    {
+        /* total_bytes is the file, tail_bytes is the bound. */
+        const char *tb = strstr(so, "\"tail_bytes\":");
+        T_REQUIRE(tb != NULL);
+        long long tail = atoll(tb + 13);
+        T_CHECK_MSG(tail == (long long)ATLAS_ORCH_LOG_TAIL_MAX, "tail_bytes %lld is not the bound",
+                    tail);
+        const char *tt = strstr(so, "\"total_bytes\":");
+        T_REQUIRE(tt != NULL);
+        T_CHECK_MSG(atoll(tt + 14) > tail, "total_bytes does not exceed the tail: %s", so);
+    }
+    const char *se = strstr(b, "\"stderr\":{");
+    T_REQUIRE_MSG(se != NULL, "no stderr block: %s", b);
+    T_CHECK_MSG(strncmp(se, "\"stderr\":{\"available\":false", 27) == 0 &&
+                    strstr(se, "wrote no log for this stream") != NULL,
+                "A's absent stderr is not stated with its reason: %s", b);
+    /* A plain non-zero exit carries no `failure` event: the row is the record. */
+    T_CHECK_MSG(strstr(b, "\"dispatcher_error\":{\"available\":false") != NULL,
+                "a plain non-zero exit produced a dispatcher error record: %s", b);
+
+    /* (g3) B: cancelled before it wrote anything. */
+    atlas_buf_reset(&resp);
+    post_form(g, "/api/v1/job/failure", submit_bearer, form_b, &resp);
+    T_REQUIRE_MSG(status_of(&resp) == 200, "failure B: %d %s", status_of(&resp), body_of(&resp));
+    b = body_of(&resp);
+    T_CHECK_MSG(strstr(b, "\"exit_kind\":\"CANCELLED\"") != NULL, "B is not CANCELLED: %s", b);
+    so = strstr(b, "\"stdout\":{");
+    T_REQUIRE(so != NULL);
+    T_CHECK_MSG(strncmp(so, "\"stdout\":{\"available\":false", 27) == 0 &&
+                    strstr(so, "wrote no log for this stream") != NULL,
+                "B's absent log is not stated with its reason: %s", b);
+
+    /* (g4) C: the gate failed, and the dispatcher said which and what it
+     * printed. UNTRUSTED_DATA, labelled. */
+    atlas_buf_reset(&resp);
+    post_form(g, "/api/v1/job/failure", submit_bearer, form_c, &resp);
+    T_REQUIRE_MSG(status_of(&resp) == 200, "failure C: %d %s", status_of(&resp), body_of(&resp));
+    b = body_of(&resp);
+    T_CHECK_MSG(strstr(b, "\"state\":\"FAILED\"") != NULL, "C did not fail: %s", b);
+    T_CHECK_MSG(strstr(b, "\"dispatcher_error\":{\"available\":true") != NULL,
+                "C's gate failure carried no dispatcher record: %s", b);
+    T_CHECK_MSG(strstr(b, "gate 0 failed: false") != NULL,
+                "C's record does not name the failed gate: %s", b);
+    {
+        const char *de = strstr(b, "\"dispatcher_error\":{");
+        T_CHECK_MSG(de != NULL && strstr(de, "\"provenance\":\"UNTRUSTED_DATA\"") != NULL,
+                    "C's record is not labelled: %s", b);
+    }
+
+    /* (g5) `job.remote_result` still carries no worker log, on the dispatcher
+     * that now carries a tail elsewhere: test_e's (e6), restated here where
+     * the log is long enough to notice. */
+    atlas_buf_reset(&resp);
+    post_form(g, "/api/v1/job/result", submit_bearer, form_a, &resp);
+    T_REQUIRE_MSG(status_of(&resp) == 200, "result A: %d %s", status_of(&resp), body_of(&resp));
+    T_CHECK_MSG(strstr(body_of(&resp), "xxxxxxxx") == NULL &&
+                    strstr(body_of(&resp), "log_tail") == NULL,
+                "a worker log reached job.remote_result: %s", body_of(&resp));
+
+    atlas_buf_free(&job_a);
+    atlas_buf_free(&job_b);
+    atlas_buf_free(&job_c);
+    atlas_buf_free(&resp);
+    atlas_gateway_close(g);
+    fx_daemon_stop(&d, false);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
     {"happy path: submit, large body, /get, /list, /cancel, audit trail",
      test_a_happy_path_and_audit},
@@ -1604,6 +1828,9 @@ static const atlas_test TESTS[] = {
      test_e_result_of_a_dispatched_job},
     {"A14R: a machine-wide active bound, and a daily bound of zero that refuses nothing",
      test_f_the_machine_wide_bound_and_the_unlimited_day},
+    {"A14R-F: why a dispatched job failed -- a tail not the file, an absence with its reason, a "
+     "gate's own record",
+     test_g_failure_of_a_dispatched_job},
 };
 
 ATLAS_TEST_MAIN("gw_submit", TESTS)

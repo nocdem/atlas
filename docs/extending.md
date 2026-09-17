@@ -1,5 +1,9 @@
 # Atlas — extension checklists
 
+Current CLI/MCP source locations and automated checks are in
+[frontend modules](frontend-modules.md). Older phase sections below retain their
+historical paths.
+
 One checklist per extensible vocabulary, table, method table or bound. They were
 in `CLAUDE.md` until A9.2.4 moved them; see `docs/engineering-rules.md` for why.
 
@@ -13,6 +17,15 @@ was written after one of those actually happened.
 The rule underneath all of them: **when you add a member to a closed vocabulary,
 find every place that switches on it, and every place that stores it.** The
 compiler finds the first kind and not the second.
+
+## MCP argument contracts
+
+Declare every accepted argument in the tool's input schema. The shared
+dispatcher checks its keys against those published properties after visibility
+and scope checks, before calling the handler. Unknown and NUL-bearing keys are
+protocol parameter errors. Required arguments, types and value bounds still
+belong in the typed readers. `tests/test_mcp_arguments.c` covers every listed
+tool automatically; include it when changing schemas or dispatch.
 
 ## Extending A8-CI safely
 
@@ -1593,6 +1606,31 @@ the boundary and not a configuration change. Before adding one:
    `unavailable_reason` that distinguishes "the attempt produced no such file"
    from "it was too large to carry". A reader must never infer an empty result
    from a missing field.
+
+### Adding a read beside `job.remote_result` (A14R-F's `job.remote_failure` is the precedent)
+
+A remote read is one row in each of three tables and one entry in each of four
+test lists, and nothing catches a missed one but the tests:
+
+1. `REMOTE_SUBMIT_METHODS[]` in `src/ipc/server_orch_remote.c`, with
+   `job.remote_result`'s scope check copied verbatim — the submitting
+   credential *and* a repository the orchestration policy still permits, both
+   refusing as "no such job". Take the job and nothing else.
+2. `API_WRITE_ROUTES[]` in `src/gw/gateway.c` (POST, `{"job", NULL}`), and
+   `WRITE_METHODS[]` in `tests/test_gateway.c`, which fails on any row it does
+   not name.
+3. `TOOLS[]` in `src/mcp/mcp_tools.c`, `remote_only = true`, `writes = false`,
+   `ATLAS_SCOPE_JOBS_SUBMIT`, envelope `MODEL_PROPOSAL` with the untrusted
+   notice whenever a worker's bytes are inside — never `ATLAS_OWNED`, the one
+   class allowed into automatic context. Then `SUBMIT_WRITES[]` and
+   `JOB_TOOLS[]` in `tests/test_gw_remote.c`, the count in
+   `tests/test_plugin.c`, and the `tools/list` check in `tests/test_gw_submit.c`.
+4. If the read needs bytes the ledger does not hold, carry them as an event
+   under the dispatcher's own lease (`ATLAS_ORCH_EVENT_KIND_*` in
+   `atlas/orch.h`) rather than adding a column or an artifact name: an event is
+   already bounded, already UNTRUSTED_DATA, and already written through one
+   point. A header the dispatcher composes ends at a `--` line, and the daemon
+   parses nothing after it.
 
 ### Adding an `atlas_orch_exit_kind` or an `atlas_orch_reason`
 

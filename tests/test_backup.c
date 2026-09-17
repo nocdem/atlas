@@ -1319,6 +1319,7 @@ static void test_no_operational_claim_is_stronger_than_the_implementation(void) 
         ATLAS_SRC_DIR "/docs/operations.md",
         ATLAS_SRC_DIR "/README.md",
         ATLAS_SRC_DIR "/CLAUDE.md",
+        ATLAS_SRC_DIR "/docs/agent-reference.md",
         ATLAS_SRC_DIR "/SECURITY.md",
         ATLAS_SRC_DIR "/include/atlas/backup.h",
         ATLAS_SRC_DIR "/include/atlas/maintenance.h",

@@ -503,6 +503,40 @@ atlas_status atlas_db_verify_claims_for_revision(atlas_db *db, int64_t document_
 
 /* --- evidence -------------------------------------------------------------- */
 
+atlas_status atlas_db_verify_tests_for_scope(atlas_db *db, int64_t repo_id,
+    const char *path, const char *symbol, int64_t limit, atlas_verify_test_cb cb,
+    void *ud, bool *more, atlas_err *err) {
+    *more = false;
+    if (limit < 1 || limit > ATLAS_SEM_MAX_ROWS) return atlas_err_set(err, ATLAS_ERR_USAGE, "invalid test record bound");
+    static const char SQL[] =
+        "SELECT e.uid,e.path_text,e.suite,e.test_name,e.result,e.commit_oid FROM verify_evidence e"
+        " WHERE e.repo_id=?1 AND e.class='TEST' AND e.test_name<>''"
+        " AND ((?2<>'' AND e.path_text=?2) OR (?3<>'' AND e.symbol=?3"
+        " AND (?2='' OR e.path_text='' OR e.path_text=?2)))"
+        " AND NOT EXISTS(SELECT 1 FROM verify_evidence n WHERE n.repo_id=e.repo_id"
+        " AND n.class='TEST' AND n.suite=e.suite AND n.test_name=e.test_name"
+        " AND n.path_text=e.path_text AND n.symbol=e.symbol AND n.id>e.id)"
+        " ORDER BY e.id DESC LIMIT ?4;";
+    sqlite3_stmt *q = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &q, err);
+    if (st != ATLAS_OK) return st;
+    (void)sqlite3_bind_int64(q, 1, repo_id);
+    (void)sqlite3_bind_int64(q, 4, limit + 1);
+    st = atlas_db_bind_text_opt(db, q, 2, path, err);
+    if (st == ATLAS_OK) st = atlas_db_bind_text_opt(db, q, 3, symbol, err);
+    int64_t n = 0;
+    int rc = SQLITE_DONE;
+    while (st == ATLAS_OK && (rc = sqlite3_step(q)) == SQLITE_ROW) {
+        if (n++ == limit) { *more = true; break; }
+        atlas_verify_test_row row = {atlas_db_col_text(q, 0), atlas_db_col_text(q, 1),
+            atlas_db_col_text(q, 2), atlas_db_col_text(q, 3), atlas_db_col_text(q, 4), atlas_db_col_text(q, 5)};
+        st = cb(&row, ud, err);
+    }
+    if (st == ATLAS_OK && rc != SQLITE_DONE && rc != SQLITE_ROW) st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read test evidence");
+    atlas_db_finish(db, q);
+    return st;
+}
+
 atlas_status atlas_db_verify_evidence_insert(atlas_db *db, atlas_verify_evidence *e,
                                              const char *now, atlas_err *err) {
     if (db == NULL || e == NULL) {

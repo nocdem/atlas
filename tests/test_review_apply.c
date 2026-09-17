@@ -1529,7 +1529,7 @@ static void test_the_operator_channel_write_points_have_the_documented_callers(v
      * own tripwire for `atlas_decision_apply_in_tx` carries the identical
      * shape ("one of which is lifecycle.c, which also defines it"). The
      * *caller* count constraints.md and this season's rule describe is two:
-     * `src/cli/cli.c` (one caller before A15) and `src/core/service_review.c`
+     * `src/cli/cli_decision.c` (one caller before A15) and `src/core/service_review.c`
      * (the second, added by this season) -- checked explicitly below by
      * naming both and excluding every other caller.
      *
@@ -1544,7 +1544,7 @@ static void test_the_operator_channel_write_points_have_the_documented_callers(v
                 sc2.files_with_calls, atlas_buf_cstr(&sc2.names));
     T_CHECK_MSG(strstr(atlas_buf_cstr(&sc2.names), "/src/core/service_decision.c") != NULL,
                 "service_decision.c must still define it: %s", atlas_buf_cstr(&sc2.names));
-    T_CHECK_MSG(strstr(atlas_buf_cstr(&sc2.names), "/src/cli/cli.c") != NULL,
+    T_CHECK_MSG(strstr(atlas_buf_cstr(&sc2.names), "/src/cli/cli_decision.c") != NULL,
                 "cli.c must remain a caller: %s", atlas_buf_cstr(&sc2.names));
     T_CHECK_MSG(strstr(atlas_buf_cstr(&sc2.names), "/src/core/service_review.c") != NULL,
                 "service_review.c must be the second caller: %s", atlas_buf_cstr(&sc2.names));

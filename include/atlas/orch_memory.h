@@ -7,7 +7,7 @@
  *
  * What it deliberately is not, and none of these is an omission:
  *
- *   - It is not a vector store, an embedding index, a summariser or a ranker.
+ *   - It is not a vector store, an embedding index or a model-based ranker.
  *     Nothing here calls a model. Selection is lexical overlap over tokens,
  *     computed the same way every time, so the same inputs produce the same
  *     package and the same digest.
@@ -68,6 +68,10 @@
 #define ATLAS_ORCH_MEMORY_GOAL_MAX 320u
 #define ATLAS_ORCH_MEMORY_DETAIL_MAX 480u
 #define ATLAS_ORCH_MEMORY_FILES_MAX 320u
+/* Only an inline patch is inspected, and only its file headers are retained.
+ * Larger, malformed or unsupported patches report incomplete path hints. */
+#define ATLAS_ORCH_MEMORY_PATCH_SCAN_MAX ATLAS_ORCH_ARTIFACT_INLINE_MAX
+#define ATLAS_ORCH_MEMORY_PATHS_MAX 64u
 
 /* Selected by the operator, never by a model payload. UNKNOWN is the zero and
  * is not storable: a persisted manifest holds OFF or BOUNDED. */
@@ -127,20 +131,27 @@ typedef struct atlas_orch_memory_cand {
     /* A name from `atlas_orch_reason`, never prose. */
     atlas_buf terminal_reason;
     int64_t failed_gate;
-    /* UNTRUSTED_DATA: a bounded excerpt of what the failing gate printed. */
+    /* UNTRUSTED_DATA: bounded historical gate output, not a verified result. */
     atlas_buf detail;
-    /* UNTRUSTED_DATA: changed paths, when a run recorded any. Usually empty,
-     * because Atlas stores no diff — absent, and never invented. */
+    /* UNTRUSTED_DATA: path hints from the last inline changes.patch artifact;
+     * they do not establish that the patch was applied or deployed. */
     atlas_buf files;
     atlas_usage_run usage;
     bool usage_present;
     atlas_orch_memory_commit_rel rel;
 
-    /* Filled in by the scorer. `overlap` is the count of distinct shared
-     * tokens; `score` folds in the commit relation. */
+    /* Filled in by the scorer. `overlap` sums distinct shared tokens per
+     * field; `score` weights fields and folds in the commit relation. */
     int64_t overlap;
     int64_t score;
+    int64_t goal_overlap, gate_overlap, failure_overlap, path_overlap;
+    bool files_incomplete;
 } atlas_orch_memory_cand;
+
+/* Pure, bounded extraction of path hints from stored Git patch headers. Never
+ * applies a patch or retains its hunks. Quoted Git paths are decoded as bytes. */
+atlas_status atlas_orch_memory_patch_paths(const void *data, size_t len, atlas_buf *paths,
+                                           bool *incomplete, atlas_err *err);
 
 void atlas_orch_memory_cand_init(atlas_orch_memory_cand *c);
 void atlas_orch_memory_cand_free(atlas_orch_memory_cand *c);

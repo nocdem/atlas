@@ -1,4 +1,71 @@
-# Structural code intelligence (A3)
+# Code intelligence
+
+Reproducible context measurements and their limits: [context benchmark](context-benchmark.md).
+
+## Start with bounded task context
+
+For an unfamiliar change, `atlas_context_build` (or `atlas context build`) is
+the first query: it combines relevant symbols, callers, candidate tests and
+recorded knowledge. The default package has at most 24 items and an estimated
+8 KiB text budget. Read freshness, coverage and `not_included` before relying
+on it; use focused follow-up queries for unresolved questions.
+
+`max_items` and `max_tokens` can request more detail. The hard ceilings remain
+400 items and 512 KiB. An item or byte limit sets `budget_reached` and states
+the omission in `not_included`. The token conversion is four bytes per token,
+not a provider token measurement; JSON and transport overhead are additional.
+Small edits to familiar code do not require a context query.
+
+### Task scope, selection and follow-up reads
+
+MCP accepts optional `paths` and `symbols` arrays, each bounded to 64 nonempty
+strings of at most 511 bytes. Paths use Atlas's reversible repository-relative
+path encoding. These are the same seeds as CLI `--path` and `--symbol`, including
+when the CLI connects through the daemon. Explicit scope takes priority over
+task prose. Wrong array types, embedded NULs and escaping paths are refused at
+the MCP and IPC boundaries.
+
+Without explicit scope, the builder tries complete paths and identifiers first,
+preserving case. When no exact seed exists it tries case-insensitive symbol
+prefixes and underscore component prefixes. It retains distinct symbol
+identities when a name is ambiguous, up to the 64-seed ceiling, and discloses
+truncated searches. Partial matching is lexical selection; it does not change
+the evidence class of a compiler-derived symbol or edge. This is not semantic
+language translation: a Turkish task can use explicit paths or symbol names.
+
+Ranking favors seed symbols and repository locations over incidental external
+callees. After the leading item, one related knowledge record and one candidate
+test receive space when available and the budget permits. Knowledge kinds and
+approval states do not gain authority from ranking. Individual items too large
+for the remaining byte budget are skipped with an omission notice.
+
+`scope` reports up to 16 files, whether each is in the file index, and its
+translation-unit counts in this semantic generation. `scope_truncated` discloses
+additional scopes. Zero units is not proof of absence: a header may be covered
+through an includer. Bounded `next_steps` explain which focused read can resolve
+coverage, seed, graph or knowledge gaps; they never run a command or rebuild an
+index. These diagnostics are additional to the item text budget.
+
+### Candidate tests and recorded test targets
+
+The builder and semantic impact query classify test files using configured
+`test_roots`, falling back to test directory/file naming only when roots are
+undeclared. `test_classification` distinguishes `DECLARED_ROOT`, `NAME_HEURISTIC`
+and `RECORDED_TEST`. Direct references and bounded transitive inbound calls
+produce candidates. Their evidence class describes the reference or call path;
+it does not prove that a test executes or covers a behavior.
+
+Up to eight stored `TEST` records per queried scope can contribute suite/target,
+last recorded result, commit and evidence UID. The newest record for each
+suite/target/path/symbol binding is used. These items remain `LEXICAL` with
+`test_result_historical: true`, including records tied to the current commit.
+Explicit file scope can retrieve them even without compiler coverage. A record
+alone never settles semantic presence. CTest names are available when recorded
+as test targets; Atlas does not infer a runnable target from a filename or parse
+CMake here. The response explicitly says that test recommendations are not
+exhaustive and that historical results do not verify the current change.
+
+## Structural code intelligence (A3)
 
 A3 gives Atlas something structural to say about C-family source: what a file
 defines, what it includes, what depends on it, and what *might* be affected if it

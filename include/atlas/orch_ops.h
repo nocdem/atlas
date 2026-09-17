@@ -733,6 +733,73 @@ atlas_status atlas_db_orch_artifacts(atlas_db *db, const char *job_uid, int64_t 
                                      bool want_content, atlas_orch_artifact_cb cb, void *ud,
                                      int64_t *count_out, atlas_err *err);
 
+/* --- A14R-F: the ledger rows `job.remote_failure` reads ---------------------
+ *
+ * Three borrowed-row readers over tables the daemon already holds, joined on
+ * the public job uid exactly as `atlas_db_orch_artifacts` is. Each pointer is
+ * valid only for the callback. None of them writes. */
+typedef struct atlas_orch_attempt_row {
+    int64_t attempt_no;
+    const char *state;
+    const char *driver;
+    const char *driver_version;
+    const char *exit_kind;
+    int64_t exit_code;
+    const char *failure_reason;
+    int64_t event_count;
+    int64_t artifact_count;
+    const char *started_at;
+    const char *ended_at; /* NULL while the attempt is open */
+    const char *dispatcher_id;
+} atlas_orch_attempt_row;
+
+typedef atlas_status (*atlas_orch_attempt_cb)(const atlas_orch_attempt_row *row, void *ud,
+                                              atlas_err *err);
+
+/* Every attempt of one job, oldest first. Bounded by the job's own
+ * `max_attempts`, which the write point already enforces. */
+atlas_status atlas_db_orch_job_attempts(atlas_db *db, const char *job_uid,
+                                        atlas_orch_attempt_cb cb, void *ud, atlas_err *err);
+
+typedef struct atlas_orch_transition_row {
+    int64_t id;
+    int64_t attempt_no; /* 0 when the transition names no attempt */
+    const char *from_state;
+    const char *to_state;
+    const char *reason;
+    const char *actor;
+    const char *detail; /* Atlas-composed at every write point, still encoded on output */
+    const char *at;
+} atlas_orch_transition_row;
+
+typedef atlas_status (*atlas_orch_transition_cb)(const atlas_orch_transition_row *row, void *ud,
+                                                 atlas_err *err);
+
+/* The whole ledger of one job, in ledger order (AUTOINCREMENT id, never a
+ * timestamp). A job's ledger is a handful of rows per attempt. */
+atlas_status atlas_db_orch_job_transitions(atlas_db *db, const char *job_uid,
+                                           atlas_orch_transition_cb cb, void *ud,
+                                           atlas_err *err);
+
+typedef struct atlas_orch_event_row {
+    int64_t attempt_no;
+    int64_t seq;
+    const char *kind;
+    const void *payload; /* UNTRUSTED_DATA, exact bytes */
+    size_t payload_len;
+    const char *at;
+} atlas_orch_event_row;
+
+typedef atlas_status (*atlas_orch_event_cb)(const atlas_orch_event_row *row, void *ud,
+                                            atlas_err *err);
+
+/* The newest `limit` events of one job, delivered oldest first. `kind` narrows
+ * to one kind when non-NULL; the limit is what keeps an attempt that emitted
+ * `ATLAS_ORCH_MAX_EVENTS` inside one response frame. */
+atlas_status atlas_db_orch_job_events(atlas_db *db, const char *job_uid, const char *kind,
+                                      int64_t limit, atlas_orch_event_cb cb, void *ud,
+                                      atlas_err *err);
+
 /* --- A8: the source snapshot manifest ---------------------------------------
  *
  * Persisted so a dispatcher that restarts mid-transfer resumes against the same

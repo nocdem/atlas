@@ -1410,7 +1410,49 @@ static void test_a_source_drift_demotes_the_conflict_axis_too(void) {
     env_close(&e);
 }
 
+static void test_nul_claims_are_refused_without_a_row(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    env e;
+    env_open(&e, &err);
+    static const char *const TEXTS[] = {"\0hidden", "visible\0hidden", "visible\0"};
+    static const size_t LENGTHS[] = {7, 14, 8};
+    for (size_t i = 0; i < sizeof TEXTS / sizeof TEXTS[0]; i++) {
+        atlas_verify_op op;
+        op_init(&op, ATLAS_VERIFY_OP_CLAIM_CREATE);
+        T_OK(atlas_buf_set_str(&op.repo_name, "proj", &err), &err);
+        T_OK(atlas_buf_set_str(&op.actor_name, "nul-regression", &err), &err);
+        T_OK(atlas_buf_set(&op.text, TEXTS[i], LENGTHS[i], &err), &err);
+        atlas_verify_intake_result res;
+        T_FAILS_WITH(apply(&e, &op, &res, &err), ATLAS_ERR_USAGE, &err);
+        T_CHECK(strstr(err.msg, "embedded NUL") != NULL);
+        sqlite3_stmt *stmt = NULL;
+        T_REQUIRE(sqlite3_prepare_v2(e.db->h,
+                    "SELECT (SELECT COUNT(*) FROM verify_claims),"
+                    " (SELECT COUNT(*) FROM verify_actors);", -1, &stmt, NULL) == SQLITE_OK);
+        T_REQUIRE(sqlite3_step(stmt) == SQLITE_ROW);
+        T_EQ_INT(sqlite3_column_int(stmt, 0), 0);
+        T_EQ_INT(sqlite3_column_int(stmt, 1), 0);
+        sqlite3_finalize(stmt);
+        atlas_verify_intake_result_free(&res);
+        atlas_verify_op_free(&op);
+    }
+    /* A refusal must not poison the transaction or reject ordinary UTF-8. */
+    atlas_buf uid = ATLAS_BUF_INIT;
+    make_claim(&e, "visible — bütünü korunur", NULL, NULL, &uid, &err);
+    atlas_verify_claim claim;
+    atlas_verify_claim_init(&claim);
+    bool found = false;
+    T_OK(atlas_db_verify_claim_find(e.db, uid.data, &claim, &found, &err), &err);
+    T_CHECK(found);
+    T_EQ_STR(claim.text.data, "visible — bütünü korunur");
+    atlas_verify_claim_free(&claim);
+    atlas_buf_free(&uid);
+    env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
+    {"NUL-bearing claims leave no claim or actor row", test_nul_claims_are_refused_without_a_row},
     {"a model can create a claim and it binds to a source state",
      test_a_model_can_create_a_claim_and_it_binds_to_a_source_state},
     {"a model cannot submit evidence only Atlas could have produced",

@@ -1025,6 +1025,20 @@ atlas_status atlas_db_sem_symbols_by_name(atlas_db *db, int64_t generation_id, c
                          cb, ud, total_out, truncated_out, err);
 }
 
+atlas_status atlas_db_sem_symbols_matching(atlas_db *db, int64_t generation_id,
+                                           const char *term, int64_t limit,
+                                           atlas_sem_symbol_cb cb, void *ud,
+                                           int64_t *total_out, bool *truncated_out,
+                                           atlas_err *err) {
+    return symbols_query(db,
+        "SELECT " SYM_COLUMNS " FROM sem_symbols s"
+        " WHERE s.generation_id = ?1 AND s.external = 0 AND ?3 = ''"
+        " AND (substr(lower(s.name), 1, length(?2)) = lower(?2)"
+        "      OR instr(lower(s.name), '_' || lower(?2)) > 0)"
+        " ORDER BY s.is_definition DESC, s.name, s.file_text, s.line LIMIT ?4;",
+        generation_id, term, "", limit, cb, ud, total_out, truncated_out, err);
+}
+
 atlas_status atlas_db_sem_symbols_in_file(atlas_db *db, int64_t generation_id,
                                           const char *file_text, int64_t limit,
                                           atlas_sem_symbol_cb cb, void *ud, int64_t *total_out,
@@ -2046,6 +2060,32 @@ atlas_status atlas_db_sem_config_forget_repo(atlas_db *db, int64_t repo_id, atla
 }
 
 /* --- A9.2.3: the coverage manifest ------------------------------------------ */
+
+atlas_status atlas_db_sem_context_scope(atlas_db *db, int64_t repo_id, int64_t generation_id,
+    const char *path, atlas_sem_context_scope *out, atlas_err *err) {
+    static const char SQL[] =
+        "SELECT EXISTS(SELECT 1 FROM files WHERE repo_id=?1 AND deleted=0 AND path_text=?3),"
+        " count(*), coalesce(sum(status='COMPLETE'),0)"
+        " FROM sem_units WHERE generation_id=?2 AND source_text=?3;";
+    sqlite3_stmt *q = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &q, err);
+    if (st != ATLAS_OK) return st;
+    (void)sqlite3_bind_int64(q, 1, repo_id);
+    (void)sqlite3_bind_int64(q, 2, generation_id);
+    st = bind_text(db, q, 3, path, err);
+    if (st == ATLAS_OK) {
+        int rc = sqlite3_step(q);
+        if (rc == SQLITE_ROW) {
+            out->in_file_index = sqlite3_column_int(q, 0) != 0;
+            out->units = sqlite3_column_int64(q, 1);
+            out->complete_units = sqlite3_column_int64(q, 2);
+        } else {
+            st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read context scope");
+        }
+    }
+    atlas_db_finish(db, q);
+    return st;
+}
 
 atlas_status atlas_db_sem_scope_counts(atlas_db *db, int64_t repo_id, int64_t generation_id,
                                        int64_t *candidates_out, int64_t *covered_out,

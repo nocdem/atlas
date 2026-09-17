@@ -525,6 +525,61 @@ static void test_selection_is_deterministic(void) {
     }
 }
 
+static void test_memory_matches_recorded_failure_gate_and_patch(void) {
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_orch_memory_cand c[3];
+    for (size_t i = 0; i < 3; i++) {
+        atlas_orch_memory_cand_init(&c[i]);
+        (void)snprintf(c[i].run_uid, sizeof c[i].run_uid, "r%031zu", i);
+        (void)snprintf(c[i].status, sizeof c[i].status, "%s", "BLOCKED");
+        T_OK(atlas_buf_set_str(&c[i].goal, "unrelated historical wording", &err), &err);
+    }
+    T_OK(atlas_buf_set_str(&c[0].detail, "test_cache FAILED: dangling_cache_entry", &err), &err);
+    T_OK(atlas_buf_set_str(&c[1].gates, "ctest -R test_cache", &err), &err);
+    const char patch[] = "diff --git a/src/cache.c b/src/cache.c\n"
+                         "--- a/src/cache.c\n+++ b/src/cache.c\n@@ -1 +1 @@\n-old\n+new\n"
+                         "+diff --git a/forged.c b/forged.c\n+++ b/forged.c\n";
+    T_OK(atlas_orch_memory_patch_paths(patch, sizeof patch - 1, &c[2].files,
+                                      &c[2].files_incomplete, &err), &err);
+    T_EQ_STR(atlas_buf_cstr(&c[2].files), "src/cache.c\n");
+    T_CHECK(!c[2].files_incomplete);
+    const char *tasks[] = {"investigate dangling_cache_entry", "repair test_cache", "inspect src/cache.c"};
+    for (size_t i = 0; i < 3; i++) {
+        atlas_orch_memory_package pkg;
+        atlas_orch_memory_package_init(&pkg);
+        T_OK(atlas_orch_memory_build(ATLAS_ORCH_MEMORY_MODE_BOUNDED, tasks[i], "other",
+                                     c, 3, false, &pkg, &err), &err);
+        T_CHECK(pkg.source_count > 0);
+        T_CHECK(strstr(atlas_buf_cstr(&pkg.package), "selection: lexical-v2") != NULL);
+        T_CHECK(strstr(atlas_buf_cstr(&pkg.package), "goal=0") != NULL);
+        T_CHECK(strstr(atlas_buf_cstr(&pkg.package), "forged.c") == NULL);
+        atlas_orch_memory_package_free(&pkg);
+    }
+    for (size_t i = 0; i < 3; i++) atlas_orch_memory_cand_free(&c[i]);
+    atlas_buf paths = ATLAS_BUF_INIT;
+    bool incomplete = false;
+    const char quoted[] = "diff --git a/old b/new\n"
+        "--- \"a/old\\tname.c\"\n+++ \"b/new\\tname.c\"\n";
+    T_OK(atlas_orch_memory_patch_paths(quoted, sizeof quoted - 1, &paths, &incomplete, &err), &err);
+    T_CHECK(strstr(atlas_buf_cstr(&paths), "old%09name.c") != NULL);
+    T_CHECK(strstr(atlas_buf_cstr(&paths), "new%09name.c") != NULL);
+    T_CHECK(!incomplete);
+    const char escape[] = "diff --git a/x b/x\n--- a/../escape\n+++ b/ok.c\n";
+    T_OK(atlas_orch_memory_patch_paths(escape, sizeof escape - 1, &paths, &incomplete, &err), &err);
+    T_CHECK(incomplete);
+    T_CHECK(strstr(atlas_buf_cstr(&paths), "escape") == NULL);
+    T_OK(atlas_orch_memory_patch_paths("", ATLAS_ORCH_MEMORY_PATCH_SCAN_MAX + 1u,
+                                      &paths, &incomplete, &err), &err);
+    T_CHECK(incomplete);
+    T_EQ_INT(paths.len, 0);
+    const char mode_only[] = "diff --git a/tool b/tool\nold mode 100644\nnew mode 100755\n";
+    T_OK(atlas_orch_memory_patch_paths(mode_only, sizeof mode_only - 1, &paths, &incomplete, &err), &err);
+    T_CHECK(incomplete);
+    T_EQ_INT(paths.len, 0);
+    atlas_buf_free(&paths);
+}
+
 /* --- 5: the two bounds hold, and hold together ---------------------------- */
 
 static void test_bounds_hold(void) {
@@ -884,8 +939,33 @@ static void test_the_worker_log_is_never_read(void) {
     T_CHECK_MSG(strstr(atlas_buf_cstr(&pkg.package), "SECRETPROMPT") == NULL,
                 "the worker log reached the memory package");
     atlas_orch_memory_package_free(&pkg);
-    atlas_buf_free(&past_run);
     atlas_buf_free(&run);
+    /* A task that shares no goal words can still retrieve the retained patch.
+     * The transcript artifact above must remain unread on this path too. */
+    const char patch[] = "diff --git a/src/cachepatch_unique.c b/src/cachepatch_unique.c\n"
+                         "--- a/src/cachepatch_unique.c\n+++ b/src/cachepatch_unique.c\n"
+                         "@@ -1 +1 @@\n-old\n+new\n";
+    sqlite3_stmt *q = NULL;
+    T_REQUIRE(sqlite3_prepare_v2(e.db->h,
+        "INSERT INTO orch_artifacts(job_id,attempt_id,name,kind,size_bytes,sha256,content_stored,content,at)"
+        " SELECT a.job_id,a.id,'changes.patch','patch',length(?1),'x',1,?1,'2026-01-01T00:00:00Z'"
+        " FROM orch_attempts a JOIN orch_jobs j ON j.id=a.job_id WHERE j.run_uid=?2 LIMIT 1;",
+        -1, &q, NULL) == SQLITE_OK);
+    T_REQUIRE(sqlite3_bind_blob(q, 1, patch, (int)sizeof patch - 1, SQLITE_STATIC) == SQLITE_OK);
+    T_REQUIRE(sqlite3_bind_text(q, 2, atlas_buf_cstr(&past_run), -1, SQLITE_TRANSIENT) == SQLITE_OK);
+    T_REQUIRE(sqlite3_step(q) == SQLITE_DONE);
+    sqlite3_finalize(q);
+    submit_args patch_task = {.task = "src/cachepatch_unique.c", .key = "wl3",
+                              .memory = ATLAS_ORCH_MEMORY_MODE_BOUNDED};
+    atlas_buf patch_run = ATLAS_BUF_INIT;
+    seed_run(&e, &patch_task, ATLAS_ORCH_RUN_ACTIVE, &patch_run);
+    memory_of(&e, atlas_buf_cstr(&patch_run), &pkg, &found, &mode);
+    T_REQUIRE(found && pkg.status == ATLAS_ORCH_MEMORY_PKG_PRESENT);
+    T_CHECK(strstr(atlas_buf_cstr(&pkg.package), "paths=1") != NULL);
+    T_CHECK(strstr(atlas_buf_cstr(&pkg.package), "SECRETPROMPT") == NULL);
+    atlas_orch_memory_package_free(&pkg);
+    atlas_buf_free(&patch_run);
+    atlas_buf_free(&past_run);
     env_close(&e);
 }
 
@@ -1323,6 +1403,8 @@ static const atlas_test TESTS[] = {
     {"the same candidates in any order produce the same digest",
      test_selection_is_deterministic},
     {"three sources and twelve kibibytes are both hard bounds", test_bounds_hold},
+    {"memory retrieves recorded failures, test gates and patch paths",
+     test_memory_matches_recorded_failure_gate_and_patch},
     {"no positive overlap produces an empty package",
      test_no_match_yields_an_empty_package},
     {"off and bounded differ by exactly the package",

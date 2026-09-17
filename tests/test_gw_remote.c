@@ -394,7 +394,7 @@ static void test_no_credential_can_reach_a_write_tool(void) {
      * same terms as `JOB_TOOLS[]` above. */
     static const char *const SUBMIT_WRITES[] = {
         "atlas_job_submit", "atlas_job_status", "atlas_job_list", "atlas_job_cancel",
-        "atlas_job_result",
+        "atlas_job_result", "atlas_job_failure",
         "atlas_deploy_propose", "atlas_deploy_status", "atlas_deploy_list", "atlas_deploy_cancel",
     };
     for (size_t i = 0; i < sizeof SUBMIT_WRITES / sizeof SUBMIT_WRITES[0]; i++) {
@@ -470,7 +470,7 @@ static void test_no_credential_can_reach_a_write_tool(void) {
      * the coverage gap for whichever task extended this file. */
     static const char *const JOB_TOOLS[] = {"atlas_job_submit", "atlas_job_status",
                                              "atlas_job_list", "atlas_job_cancel",
-                                             "atlas_job_result",
+                                             "atlas_job_result", "atlas_job_failure",
                                              "atlas_deploy_propose", "atlas_deploy_status",
                                              "atlas_deploy_list", "atlas_deploy_cancel"};
     for (size_t i = 0; i < sizeof JOB_TOOLS / sizeof JOB_TOOLS[0]; i++) {

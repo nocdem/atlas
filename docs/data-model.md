@@ -1,11 +1,15 @@
 # Data model
 
-The database is a **rebuildable index**. Every row in it is derived from Git or
-from the working tree, and every row can be reconstructed by rescanning. Nothing
-in Atlas treats it as the canonical record of history.
+The database contains both **rebuildable repository indexes** and **canonical
+engineering records**. Git and the working tree are authoritative for source
+facts. Decision revisions, lifecycle events, attribution and evidence cannot
+all be recovered by rescanning; preserve them through the verified backup and
+retention procedures in [operations](operations.md).
 
-Current schema version: **5**. `atlas doctor` reports the version in force and the
-version the binary expects.
+Current schema version: **33** (`ATLAS_SCHEMA_VERSION` in `include/atlas/db.h`).
+`atlas doctor` reports the version in force and the version the binary expects.
+The numbered migration array in `src/db/migrate.c` is the complete executable
+inventory. Migration and phase sections below retain their historical scope.
 
 ## Migrations
 
@@ -21,7 +25,7 @@ read.
 
 Applied migrations are recorded in `schema_migrations(version, name, applied_at)`.
 
-Applied so far:
+The first five migrations established the repository-index foundation:
 
 1. **initial schema** — every table listed below.
 2. **worktree identity** — adds `git_dir`, `git_dir_text` and `is_linked_worktree`
@@ -50,8 +54,8 @@ Set at open time and verified by `atlas doctor`:
 | --- | --- | --- |
 | `foreign_keys` | `ON` | cascade deletes are load-bearing for `repo remove` |
 | `journal_mode` | `WAL` where supported | concurrent readers; the actual mode in force is reported |
-| `busy_timeout` | 5000 ms | a concurrent scan waits rather than failing instantly |
-| `synchronous` | `NORMAL` | the index is rebuildable, so full fsync is not worth the cost |
+| `busy_timeout` | 5000 ms | bounded SQLite lock wait; daemon writes still belong to one writer |
+| `synchronous` | `NORMAL` | the current runtime setting; it does not make canonical records disposable or establish durability against power loss |
 
 `integrity_check` and `foreign_key_check` are both run by `atlas doctor`, and both
 are bounded to the first 20 reported rows so a corrupt file cannot flood the

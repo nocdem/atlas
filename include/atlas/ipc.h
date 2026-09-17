@@ -187,6 +187,8 @@ const char *atlas_ipc_request_method(const atlas_ipc_request *req);
 bool atlas_ipc_param_str(const atlas_ipc_request *req, const char *key, const char **out);
 bool atlas_ipc_param_int(const atlas_ipc_request *req, const char *key, int64_t *out);
 bool atlas_ipc_param_bool(const atlas_ipc_request *req, const char *key, bool *out);
+/* Distinguish an omitted optional field from a present field of the wrong type. */
+bool atlas_ipc_param_present(const atlas_ipc_request *req, const char *key);
 
 /* An array of strings. A2 needs one — a list of paths a reason concerns — and
  * it is the only aggregate the protocol accepts, deliberately: every other

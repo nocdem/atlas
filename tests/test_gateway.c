@@ -1576,6 +1576,7 @@ static void test_every_write_route_is_a_disposal_on_the_reviewed_allowlist(void)
         "job.remote_submit",
         "job.remote_get",
         "job.remote_result",
+        "job.remote_failure",
         "job.remote_list",
         "job.remote_cancel",
         "deploy.remote_propose",

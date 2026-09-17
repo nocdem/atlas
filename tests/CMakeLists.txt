@@ -137,6 +137,7 @@ set(ATLAS_TESTS
   test_ai_schema
   test_ai_trust
   test_mcp
+  test_mcp_arguments
   test_mcp_roots
   test_ai_attribution
   test_hooks
@@ -145,6 +146,7 @@ set(ATLAS_TESTS
   test_code_lex
   test_code_graph
   test_sem
+  test_context_benchmark
   test_sem_freshness
   test_sem_discovery
   test_sem_trust
@@ -416,6 +418,7 @@ endforeach()
 # A repository is required for the integration suites; a missing git makes them
 # fail loudly rather than silently pass.
 set_tests_properties(test_sem PROPERTIES LABELS "integration")
+set_tests_properties(test_context_benchmark PROPERTIES LABELS "integration;benchmark" TIMEOUT 120 SKIP_RETURN_CODE 77)
 set_tests_properties(test_sem_freshness PROPERTIES LABELS "integration")
 set_tests_properties(test_sem_discovery PROPERTIES LABELS "integration")
 # A13.1. It also scans `src/` for a second caller of the raw build-input walk,
@@ -469,7 +472,7 @@ set_tests_properties(test_fixture PROPERTIES LABELS "unit")
 
 # A2. test_ai_schema drives the storage layer in process; test_mcp and
 # test_plugin fork the binary but need no daemon and no repository.
-set_tests_properties(test_ai_schema test_mcp test_plugin PROPERTIES LABELS "unit")
+set_tests_properties(test_ai_schema test_mcp test_mcp_arguments test_plugin PROPERTIES LABELS "unit")
 
 # A3. The extractor is pure — bytes in, a bounded object out — so its suite needs
 # no repository, no database and no daemon, and belongs in the fast subset.

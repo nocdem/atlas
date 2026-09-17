@@ -14,7 +14,7 @@
  * The context builder adds one more constraint. It is **deterministic**: the
  * same repository, generation and request produce the same package. Ranking
  * therefore uses only counted, comparable facts — how many of the task's terms
- * a name contains, how far an item is from a seed, how strong its evidence —
+ * a name contains, how far an item is from a seed, whether it is repository code —
  * and never a judgement, because a judgement is not reproducible and would make
  * two identical requests disagree.
  *
@@ -41,7 +41,8 @@ static const char *const SELECTION_REASONS[] = {
     ATLAS_SEM_SEL_INCLUDES,           ATLAS_SEM_SEL_INCLUDED_BY_SUBJECT,
     ATLAS_SEM_SEL_TYPE,               ATLAS_SEM_SEL_TEST_BY_REFERENCE,
     ATLAS_SEM_SEL_TEST_BY_NAME,       ATLAS_SEM_SEL_DECISION,
-    ATLAS_SEM_SEL_SUBJECT,
+    ATLAS_SEM_SEL_SUBJECT, ATLAS_SEM_SEL_TASK_MATCH,
+    ATLAS_SEM_SEL_TEST_TRANSITIVE, ATLAS_SEM_SEL_TEST_RECORD,
 };
 
 const char *atlas_sem_selection_reason_intern(const char *reason) {
@@ -129,6 +130,11 @@ static atlas_status item_add(item_list *l, const char *kind, const char *name, c
             }
             if (depth < e->depth) {
                 e->depth = depth;
+            }
+            if (strcmp(why, ATLAS_SEM_SEL_SUBJECT) == 0 ||
+                (strcmp(why, ATLAS_SEM_SEL_TASK_MATCH) == 0 &&
+                 strcmp(e->why, ATLAS_SEM_SEL_SUBJECT) != 0)) {
+                e->why = atlas_sem_selection_reason_intern(why);
             }
             return ATLAS_OK;
         }
@@ -228,6 +234,79 @@ static void note_missing(atlas_sem_context_report *out, const char *what) {
     out->missing[out->missing_count++] = what;
 }
 
+static const char *const CONTEXT_ADVICE[] = {
+    "Read atlas_sem_status to inspect build inputs, discovery obstacles and incomplete units; a current index may still have coverage gaps.",
+    "Retry atlas_context_build with explicit paths or symbols; preserve the original task and narrow one scope at a time.",
+    "Use atlas_sem_impact for the specific symbol or file, or increase the context budget; omitted items are not evidence of absence.",
+    "Resolve the symbol with atlas_sem_symbol, then inspect atlas_sem_callers and atlas_sem_callees; unresolved indirect calls remain unknown.",
+    "Read atlas_decisions with the path filter for each relevant file; missing records in this package do not establish that no project rule applies.",
+    "Inspect the listed file scopes: zero translation units does not prove a file is absent, and headers may be covered through includers.",
+    "Review candidate tests and recorded suite/target mappings, then run the repository's trusted checks; historical results do not verify this change.",
+};
+
+const char *atlas_sem_context_advice_intern(const char *text) {
+    if (text == NULL) return NULL;
+    for (size_t i = 0; i < sizeof CONTEXT_ADVICE / sizeof CONTEXT_ADVICE[0]; i++) {
+        if (strcmp(text, CONTEXT_ADVICE[i]) == 0) return CONTEXT_ADVICE[i];
+    }
+    return NULL;
+}
+
+static void context_advice(atlas_sem_context_report *out) {
+    bool want[sizeof CONTEXT_ADVICE / sizeof CONTEXT_ADVICE[0]] = {false};
+    for (size_t i = 0; i < out->missing_count; i++) {
+        const char *m = out->missing[i];
+        if (!strcmp(m, ATLAS_SEM_MISSING_INDEX) || !strcmp(m, ATLAS_SEM_MISSING_STALE) ||
+            !strcmp(m, ATLAS_SEM_MISSING_COVERAGE) || !strcmp(m, ATLAS_SEM_MISSING_DISCOVERY)) want[0] = true;
+        if (!strcmp(m, ATLAS_SEM_MISSING_SEEDS) || !strcmp(m, ATLAS_SEM_MISSING_SEARCH)) want[1] = true;
+        if (!strcmp(m, ATLAS_SEM_MISSING_ITEMS) || !strcmp(m, ATLAS_SEM_MISSING_BUDGET)) want[2] = true;
+        if (!strcmp(m, ATLAS_SEM_MISSING_GRAPH)) want[3] = true;
+        if (!strcmp(m, ATLAS_SEM_MISSING_TESTS)) want[6] = true;
+        if (!strcmp(m, ATLAS_SEM_MISSING_DECISIONS) || !strcmp(m, ATLAS_SEM_MISSING_KNOWLEDGE)) want[4] = true;
+    }
+    for (size_t i = 0; i < out->scope_count; i++) {
+        const atlas_sem_context_scope *f = &out->scope[i];
+        if (!f->in_file_index || f->units == 0 || f->units != f->complete_units) want[5] = true;
+    }
+    out->next_step_count = 0;
+    for (size_t i = 0; i < sizeof want / sizeof want[0]; i++) {
+        if (want[i]) out->next_steps[out->next_step_count++] = CONTEXT_ADVICE[i];
+    }
+}
+
+static atlas_status context_scope_add(atlas_db *db, const char *path,
+                                      atlas_sem_context_report *out, atlas_err *err) {
+    if (path == NULL || path[0] == '\0') return ATLAS_OK;
+    atlas_buf raw = ATLAS_BUF_INIT, encoded = ATLAS_BUF_INIT;
+    atlas_err ignored;
+    atlas_err_init(&ignored);
+    atlas_status st = atlas_path_text_decode(path, strlen(path), &raw, &ignored);
+    if (st == ATLAS_OK) st = atlas_path_check_relative(raw.data, raw.len, &ignored);
+    if (st != ATLAS_OK) { atlas_buf_free(&raw); return ATLAS_OK; }
+    st = atlas_path_text_encode(raw.data, raw.len, &encoded, err);
+    atlas_buf_free(&raw);
+    if (st != ATLAS_OK) { atlas_buf_free(&encoded); return st; }
+    char canonical[512];
+    if (encoded.len >= sizeof canonical) {
+        out->scope_truncated = true;
+        atlas_buf_free(&encoded);
+        return ATLAS_OK;
+    }
+    (void)snprintf(canonical, sizeof canonical, "%s", atlas_buf_cstr(&encoded));
+    atlas_buf_free(&encoded);
+    path = canonical;
+    for (size_t i = 0; i < out->scope_count; i++) {
+        if (strcmp(out->scope[i].path, path) == 0) return ATLAS_OK;
+    }
+    if (out->scope_count == ATLAS_SEM_CONTEXT_MAX_SCOPE || strlen(path) >= sizeof out->scope[0].path) {
+        out->scope_truncated = true;
+        return ATLAS_OK;
+    }
+    atlas_sem_context_scope *f = &out->scope[out->scope_count++];
+    (void)snprintf(f->path, sizeof f->path, "%s", path);
+    return atlas_db_sem_context_scope(db, out->repo.id, out->generation.id, path, f, err);
+}
+
 /* --- A9.1: the recorded knowledge anchored to what the task touches ----------
  *
  * `ATLAS_SEM_SEL_DECISION` and `ATLAS_SEM_MISSING_DECISIONS` were in the
@@ -265,7 +344,7 @@ static void note_missing(atlas_sem_context_report *out, const char *what) {
 static atlas_status add_knowledge(atlas_db *db, const atlas_sem_context_req *req,
                                   atlas_sem_context_report *out, item_list *list, size_t *count,
                                   atlas_err *err) {
-    const char *anchors[ATLAS_SEM_CONTEXT_MAX_DECISION_ANCHORS];
+    char anchors[ATLAS_SEM_CONTEXT_MAX_DECISION_ANCHORS][512];
     size_t nanchors = 0;
     const size_t cap = sizeof anchors / sizeof anchors[0];
 
@@ -275,13 +354,16 @@ static atlas_status add_knowledge(atlas_db *db, const atlas_sem_context_req *req
     const char *p = req->paths;
     const char *pend = p != NULL ? p + req->paths_len : NULL;
     while (p != NULL && p < pend && *p != '\0' && nanchors < cap) {
-        anchors[nanchors++] = p;
+        (void)snprintf(anchors[nanchors++], sizeof anchors[0], "%s", p);
         p += strlen(p) + 1;
+    }
+    if (p != NULL && p < pend && *p != '\0') {
+        note_missing(out, ATLAS_SEM_MISSING_KNOWLEDGE);
     }
     /* Then the distinct files the seeds reached. A `decision` item has no file to
      * anchor from, so only code items seed this — which also makes the pass
      * non-recursive by construction. */
-    for (size_t i = 0; i < *count && nanchors < cap; i++) {
+    for (size_t i = 0; i < *count; i++) {
         const char *f = (*list->items)[i].file_text;
         if (f[0] == '\0' || strcmp((*list->items)[i].kind, "decision") == 0) {
             continue;
@@ -294,7 +376,11 @@ static atlas_status add_knowledge(atlas_db *db, const atlas_sem_context_req *req
             }
         }
         if (!seen) {
-            anchors[nanchors++] = f;
+            if (nanchors == cap) {
+                note_missing(out, ATLAS_SEM_MISSING_KNOWLEDGE);
+                continue;
+            }
+            (void)snprintf(anchors[nanchors++], sizeof anchors[0], "%s", f);
         }
     }
 
@@ -311,9 +397,11 @@ static atlas_status add_knowledge(atlas_db *db, const atlas_sem_context_req *req
             atlas_err_init(&ignored);
             /* A failure to read one anchor's records must not empty the rest of
              * the package: the code half is still true. */
-            (void)atlas_db_decision_for_path(db, out->repo.id, raw.data, raw.len, NULL,
+            atlas_status read_st = atlas_db_decision_for_path(db, out->repo.id, raw.data, raw.len,
+                                             req->include_history ? NULL : "APPROVED",
                                              ATLAS_SEM_CONTEXT_MAX_DECISIONS_PER_ANCHOR,
                                              take_decision, &sink, &n, &more, &ignored);
+            if (read_st != ATLAS_OK || more) note_missing(out, ATLAS_SEM_MISSING_KNOWLEDGE);
             st = sink.st;
         }
         atlas_buf_free(&raw);
@@ -346,27 +434,88 @@ static bool path_looks_like_a_test(const char *path) {
     if (path == NULL || path[0] == '\0') {
         return false;
     }
-    /* Substring checks on path components only. Deliberately conservative: a
-     * false positive is a wasted suggestion, and the item says it was selected
-     * by naming so a reader can discount it. */
-    return strstr(path, "test") != NULL || strstr(path, "Test") != NULL ||
-           strstr(path, "spec") != NULL;
+    const char *p = path;
+    while (*p != '\0') {
+        const char *slash = strchr(p, '/');
+        size_t n = slash != NULL ? (size_t)(slash - p) : strlen(p);
+        if ((n == 4 && memcmp(p, "test", 4) == 0) ||
+            (n == 5 && memcmp(p, "tests", 5) == 0) ||
+            (n == 4 && memcmp(p, "spec", 4) == 0) ||
+            (n >= 5 && memcmp(p, "test_", 5) == 0) ||
+            (n >= 5 && memcmp(p, "spec_", 5) == 0)) return true;
+        if (slash == NULL) break;
+        p = slash + 1;
+    }
+    return false;
+}
+
+static bool context_test_path(const char *path, const char *roots) {
+    return roots != NULL && roots[0] != '\0' ? atlas_sem_path_under_prefix(roots, path)
+                                             : path_looks_like_a_test(path);
+}
+
+static atlas_status add_test_file(item_list *list, const char *file, int64_t line,
+                                  atlas_sem_evidence ev, const char *why, int64_t depth,
+                                  const char *roots, atlas_err *err) {
+    size_t before = *list->count;
+    atlas_status st = item_add(list, "file", file, file, line, ev, why, depth, err);
+    if (st == ATLAS_OK && *list->count > before) {
+        atlas_sem_item *it = &(*list->items)[before];
+        (void)snprintf(it->test_classification, sizeof it->test_classification, "%s",
+                       roots != NULL && roots[0] != '\0' ? "DECLARED_ROOT" : "NAME_HEURISTIC");
+    }
+    return st;
 }
 
 typedef struct test_sink {
     item_list *list;
-    const char *subject;
+    const char *roots;
     atlas_status st;
 } test_sink;
 
 static atlas_status take_test_ref(const atlas_sem_edge_row *row, void *ud, atlas_err *err) {
-    test_sink *t = (test_sink *)ud;
-    if (!path_looks_like_a_test(row->file_text)) {
-        return ATLAS_OK;
-    }
-    t->st = item_add(t->list, "file", row->file_text, row->file_text, row->line,
-                     ATLAS_SEM_EV_PROVEN, ATLAS_SEM_SEL_TEST_BY_REFERENCE, 1, err);
+    test_sink *t = ud;
+    if (!context_test_path(row->file_text, t->roots)) return ATLAS_OK;
+    atlas_sem_evidence ev = ATLAS_SEM_EV_UNKNOWN;
+    (void)atlas_sem_evidence_parse(row->evidence, &ev);
+    t->st = add_test_file(t->list, row->file_text, row->line, ev,
+                          ATLAS_SEM_SEL_TEST_BY_REFERENCE, 1, t->roots, err);
     return t->st;
+}
+
+typedef struct recorded_test_sink {
+    item_list *list;
+    const char *anchor;
+    bool omitted;
+} recorded_test_sink;
+
+static atlas_status take_recorded_test(const atlas_verify_test_row *row, void *ud, atlas_err *err) {
+    recorded_test_sink *s = ud;
+    atlas_sem_item meta = {0};
+    const char *values[] = {row->suite,row->name,row->result,row->commit,row->uid};
+    char *fields[] = {meta.test_suite,meta.test_target,meta.test_result,meta.test_commit,meta.test_evidence_uid};
+    size_t caps[] = {sizeof meta.test_suite,sizeof meta.test_target,sizeof meta.test_result,
+                     sizeof meta.test_commit,sizeof meta.test_evidence_uid};
+    for (size_t i = 0; i < sizeof values / sizeof values[0]; i++) {
+        if (strlen(values[i]) >= caps[i]) { s->omitted = true; return ATLAS_OK; }
+        memcpy(fields[i], values[i], strlen(values[i]) + 1);
+    }
+    const char *path = row->path[0] != '\0' ? row->path : s->anchor;
+    if (strlen(path) >= sizeof meta.file_text) { s->omitted = true; return ATLAS_OK; }
+    size_t before = *s->list->count;
+    (void)snprintf(meta.name, sizeof meta.name, "%s:%s", row->suite, row->name);
+    atlas_status st = item_add(s->list, "test", meta.name, path, 0, ATLAS_SEM_EV_LEXICAL,
+                               ATLAS_SEM_SEL_TEST_RECORD, 1, err);
+    if (st == ATLAS_OK && *s->list->count > before) {
+        atlas_sem_item *it = &(*s->list->items)[before];
+        memcpy(it->test_suite, meta.test_suite, sizeof it->test_suite);
+        memcpy(it->test_target, meta.test_target, sizeof it->test_target);
+        memcpy(it->test_result, meta.test_result, sizeof it->test_result);
+        memcpy(it->test_commit, meta.test_commit, sizeof it->test_commit);
+        memcpy(it->test_evidence_uid, meta.test_evidence_uid, sizeof it->test_evidence_uid);
+        (void)snprintf(it->test_classification, sizeof it->test_classification, "%s", "RECORDED_TEST");
+    }
+    return st;
 }
 
 /* --- the subject ---------------------------------------------------------------
@@ -413,6 +562,8 @@ typedef struct walk_collect {
     const char *why_direct;
     const char *why_deep;
     atlas_status st;
+    const char *test_roots;
+    bool tests;
 } walk_collect;
 
 static atlas_status take_reached(const atlas_sem_walk_row *row, void *ud, atlas_err *err) {
@@ -422,6 +573,11 @@ static atlas_status take_reached(const atlas_sem_walk_row *row, void *ud, atlas_
     w->st = item_add(w->list, "symbol", row->name[0] != '\0' ? row->name : row->usr,
                      row->file_text, row->line, ev,
                      row->depth <= 1 ? w->why_direct : w->why_deep, row->depth, err);
+    if (w->st == ATLAS_OK && w->tests && context_test_path(row->file_text, w->test_roots)) {
+        w->st = add_test_file(w->list, row->file_text, row->line, ev,
+                              row->depth <= 1 ? ATLAS_SEM_SEL_TEST_BY_REFERENCE : ATLAS_SEM_SEL_TEST_TRANSITIVE,
+                              row->depth, w->test_roots, err);
+    }
     return w->st;
 }
 
@@ -476,15 +632,21 @@ static atlas_status copy_repo(atlas_repo_info *dst, const atlas_repo_info *src, 
  * a read-only `atlas_db` and has resolved the repository itself) run *the same*
  * implementation. Parity between the two surfaces is then structural rather
  * than a pair of functions somebody has to keep in step. */
-atlas_status atlas_sem_impact_on(atlas_db *db, const atlas_repo_info *repo, const char *subject,
-                                 int64_t depth, int64_t limit, atlas_sem_impact_report *out,
-                                 atlas_err *err) {
+static atlas_status impact_at(atlas_db *db, const atlas_repo_info *repo, const char *subject,
+                               const char *usr, const atlas_sem_generation *generation,
+                               const atlas_sem_trust *trust, int64_t depth, int64_t limit,
+                               atlas_sem_impact_report *out, atlas_err *err) {
     atlas_status st = copy_repo(&out->repo, repo, err);
     if (st != ATLAS_OK) {
         return st;
     }
     bool found = false;
-    st = atlas_db_sem_current(db, out->repo.id, &out->generation, &found, err);
+    if (generation != NULL) {
+        out->generation = *generation;
+        found = true;
+    } else {
+        st = atlas_db_sem_current(db, out->repo.id, &out->generation, &found, err);
+    }
     if (st != ATLAS_OK) {
         return st;
     }
@@ -496,7 +658,11 @@ atlas_status atlas_sem_impact_on(atlas_db *db, const atlas_repo_info *repo, cons
     /* A9.2.5. One gatherer, replacing `atlas_sem_freshness_now`: both compute
      * freshness from the same single pass, and calling both would hash every
      * source twice per response. */
-    atlas_sem_trust_now(db, &out->repo, &out->generation, true, false, &out->trust);
+    if (trust != NULL) {
+        out->trust = *trust;
+    } else {
+        atlas_sem_trust_now(db, &out->repo, &out->generation, true, false, &out->trust);
+    }
     out->freshness = out->trust.freshness;
     out->stale_reason = out->trust.stale_reason;
     (void)snprintf(out->query, sizeof out->query, "%s", subject);
@@ -513,13 +679,18 @@ atlas_status atlas_sem_impact_on(atlas_db *db, const atlas_repo_info *repo, cons
     atlas_buf_init(&sub.seen);
     int64_t total = 0;
     bool trunc = false;
-    st = atlas_db_sem_symbols_by_name(db, gen, subject, NULL, NULL,
+    st = atlas_db_sem_symbols_by_name(db, gen, subject, usr, NULL,
                                       ATLAS_SEM_MAX_ROWS, take_subject, &sub, &total, &trunc, err);
     atlas_buf_free(&sub.seen);
     if (st != ATLAS_OK) {
         return st;
     }
 
+    atlas_sem_config cfg;
+    atlas_sem_config_init(&cfg);
+    st = atlas_db_sem_config_get(db, out->repo.id, &cfg, err);
+    if (st != ATLAS_OK) { atlas_sem_config_free(&cfg); return st; }
+    const char *test_roots = atlas_buf_cstr(&cfg.test_roots);
     if (sub.distinct > 0) {
         out->subject_found = true;
         st = item_add(&list, "symbol", sub.name, sub.file, sub.line, ATLAS_SEM_EV_PROVEN,
@@ -536,7 +707,7 @@ atlas_status atlas_sem_impact_on(atlas_db *db, const atlas_repo_info *repo, cons
             o.depth = depth;
             o.max_rows = limit > 0 ? limit : ATLAS_SEM_MAX_ROWS;
             walk_collect wc = {&list, ATLAS_SEM_SEL_DIRECT_CALLER,
-                               ATLAS_SEM_SEL_TRANSITIVE_CALLER, ATLAS_OK};
+                               ATLAS_SEM_SEL_TRANSITIVE_CALLER, ATLAS_OK, test_roots, true};
             atlas_sem_walk_summary sum;
             st = atlas_sem_walk(db, gen, &o, take_reached, &wc, &sum, err);
             if (st == ATLAS_OK) {
@@ -558,13 +729,17 @@ atlas_status atlas_sem_impact_on(atlas_db *db, const atlas_repo_info *repo, cons
             o.inbound = false;
             o.depth = 1;
             o.max_rows = limit > 0 ? limit : ATLAS_SEM_MAX_ROWS;
-            walk_collect wc = {&list, ATLAS_SEM_SEL_CALLEE, ATLAS_SEM_SEL_CALLEE, ATLAS_OK};
+            walk_collect wc = {&list, ATLAS_SEM_SEL_CALLEE, ATLAS_SEM_SEL_CALLEE, ATLAS_OK, test_roots, false};
             atlas_sem_walk_summary sum;
             st = atlas_sem_walk(db, gen, &o, take_reached, &wc, &sum, err);
             if (st == ATLAS_OK) {
                 st = wc.st;
             }
             out->unresolved_indirect += sum.unresolved_indirect;
+            if (sum.truncated) {
+                out->truncated = true;
+                out->truncated_reason = sum.truncated_reason;
+            }
         }
 
         /* Files that include the file the subject lives in. */
@@ -578,11 +753,12 @@ atlas_status atlas_sem_impact_on(atlas_db *db, const atlas_repo_info *repo, cons
             if (st == ATLAS_OK) {
                 st = ic.st;
             }
+            out->truncated = out->truncated || t2;
         }
 
         /* Tests that reference it. */
         if (st == ATLAS_OK) {
-            test_sink ts = {&list, sub.usr, ATLAS_OK};
+            test_sink ts = {&list, test_roots, ATLAS_OK};
             int64_t n = 0;
             bool t2 = false;
             st = atlas_db_sem_edges_of(db, gen, sub.usr, true, NULL, false,
@@ -590,6 +766,7 @@ atlas_status atlas_sem_impact_on(atlas_db *db, const atlas_repo_info *repo, cons
             if (st == ATLAS_OK) {
                 st = ts.st;
             }
+            out->truncated = out->truncated || t2;
         }
     } else {
         /* Not a symbol: treat it as a file. */
@@ -603,6 +780,7 @@ atlas_status atlas_sem_impact_on(atlas_db *db, const atlas_repo_info *repo, cons
         if (st == ATLAS_OK) {
             st = fc.st;
         }
+        out->truncated = out->truncated || t2;
         out->subject_found = n > 0;
         if (st == ATLAS_OK) {
             includer_collect ic = {&list, ATLAS_OK};
@@ -612,8 +790,20 @@ atlas_status atlas_sem_impact_on(atlas_db *db, const atlas_repo_info *repo, cons
             if (st == ATLAS_OK) {
                 st = ic.st;
             }
+            out->truncated = out->truncated || t2;
         }
     }
+
+    if (st == ATLAS_OK) {
+        const char *anchor = sub.distinct > 0 ? sub.file : subject;
+        recorded_test_sink sink = {&list, anchor, false};
+        bool more = false;
+        st = atlas_db_verify_tests_for_scope(db, repo->id, anchor,
+                sub.distinct > 0 ? sub.name : "", ATLAS_SEM_CONTEXT_TEST_RECORDS,
+                take_recorded_test, &sink, &more, err);
+        out->truncated = out->truncated || more || sink.omitted;
+    }
+    atlas_sem_config_free(&cfg);
 
     /* Tally, split. A total would hide exactly the distinction this layer
      * exists to keep. */
@@ -639,18 +829,28 @@ atlas_status atlas_sem_impact_on(atlas_db *db, const atlas_repo_info *repo, cons
      * like any other: nothing found over a generation that read a third of the
      * tree is not evidence that a change reaches nothing. */
     if (st == ATLAS_OK) {
-        atlas_sem_trust_settle(&out->trust, (int64_t)out->count, out->truncated);
+        int64_t semantic_count = 0;
+        for (size_t i = 0; i < out->count; i++) {
+            if (strcmp(out->items[i].kind, "test") != 0) semantic_count++;
+        }
+        atlas_sem_trust_settle(&out->trust, semantic_count, out->truncated);
     }
     return st;
+}
+
+atlas_status atlas_sem_impact_on(atlas_db *db, const atlas_repo_info *repo, const char *subject,
+                                 int64_t depth, int64_t limit, atlas_sem_impact_report *out,
+                                 atlas_err *err) {
+    return impact_at(db, repo, subject, NULL, NULL, NULL, depth, limit, out, err);
 }
 
 /* --- the context package --------------------------------------------------------
  *
  * Ranking is a small integer score, and every term of it is a counted fact:
  *
- *   +8  the item is a seed, or the subject the task named
+ *   +32 an exact seed, +24 a lexical seed candidate
  *   +4  per task term the item's name or path contains (capped)
- *   +3  evidence PROVEN, +1 CANDIDATE, 0 LEXICAL
+ *   +8  a repository location; external callees receive no location bonus
  *   -1  per level of depth from a seed
  *
  * Nothing here consults a model, and nothing depends on the order rows came
@@ -661,7 +861,9 @@ atlas_status atlas_sem_impact_on(atlas_db *db, const atlas_repo_info *repo, cons
 static int score_of(const atlas_sem_item *it, const char *const *terms, size_t nterms) {
     int score = 0;
     if (it->why != NULL && strcmp(it->why, ATLAS_SEM_SEL_SUBJECT) == 0) {
-        score += 8;
+        score += 32;
+    } else if (it->why != NULL && strcmp(it->why, ATLAS_SEM_SEL_TASK_MATCH) == 0) {
+        score += 24;
     }
     int matched = 0;
     for (size_t i = 0; i < nterms && matched < 3; i++) {
@@ -673,12 +875,11 @@ static int score_of(const atlas_sem_item *it, const char *const *terms, size_t n
             matched++;
         }
     }
-    atlas_sem_evidence ev = ATLAS_SEM_EV_UNKNOWN;
-    (void)atlas_sem_evidence_parse(it->evidence, &ev);
-    if (ev == ATLAS_SEM_EV_PROVEN) {
-        score += 3;
-    } else if (ev == ATLAS_SEM_EV_CANDIDATE) {
-        score += 1;
+    /* Evidence says what was established, not whether it helps this task.
+     * A compiler-proven call to an external allocator must not automatically
+     * outrank a related repository test or knowledge record. */
+    if (it->file_text[0] != '\0') {
+        score += 8;
     }
     score -= (int)it->depth;
     return score;
@@ -705,44 +906,177 @@ static int rank_cmp(const void *a, const void *b) {
     if (x->it->line != y->it->line) {
         return x->it->line < y->it->line ? -1 : 1;
     }
-    return strcmp(x->it->name, y->it->name);
+    c = strcmp(x->it->name, y->it->name);
+    return c != 0 ? c : strcmp(x->it->kind, y->it->kind);
 }
 
-/* Splits the task into lowercase terms of three characters or more.
- *
- * Deliberately crude: this is a ranking aid, not comprehension. A term that
- * happens to appear in a symbol name lifts that symbol; a term that appears
- * nowhere costs nothing. Nothing about the task is interpreted as an
- * instruction, because nothing here can act on one. */
+static bool is_test_item(const atlas_sem_item *it) {
+    return strcmp(it->why, ATLAS_SEM_SEL_TEST_BY_REFERENCE) == 0 ||
+           strcmp(it->why, ATLAS_SEM_SEL_TEST_BY_NAME) == 0 ||
+           strcmp(it->why, ATLAS_SEM_SEL_TEST_TRANSITIVE) == 0 ||
+           strcmp(it->why, ATLAS_SEM_SEL_TEST_RECORD) == 0;
+}
+
+/* Keep the leading subject, then offer one knowledge record and one test when
+ * present. The rest retains score order. This reserves representation, never
+ * ranks knowledge kinds or promotes their evidence. Limits still apply. */
+static void diversify(ranked *r, size_t n) {
+    size_t slot = 1;
+    for (unsigned category = 0; category < 2 && slot < n; category++) {
+        bool already = category == 0 ? strcmp(r[0].it->kind, "decision") == 0
+                                      : is_test_item(r[0].it);
+        if (already) continue;
+        for (size_t i = slot; i < n; i++) {
+            bool match = category == 0 ? strcmp(r[i].it->kind, "decision") == 0
+                                      : is_test_item(r[i].it);
+            if (!match) continue;
+            ranked chosen = r[i];
+            memmove(r + slot + 1, r + slot, (i - slot) * sizeof(*r));
+            r[slot++] = chosen;
+            break;
+        }
+    }
+}
+
+/* Identifiers keep their case; paths keep separators and percent encoding.
+ * UTF-8 bytes stay together, so non-English words do not become unrelated
+ * ASCII fragments. This is lexical retrieval, not translation. */
+static bool term_byte(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c >= 128 || c == '_' || c == '/' ||
+           c == '.' || c == '-' || c == '%';
+}
+
 static size_t split_terms(const char *task, char *buf, size_t bufsz, const char **terms,
-                          size_t max_terms) {
-    size_t n = 0;
-    size_t used = 0;
+                          size_t max_terms, bool *truncated) {
+    size_t n = 0, used = 0;
     const char *p = task;
-    while (*p != '\0' && n < max_terms && used + 1 < bufsz) {
-        while (*p != '\0' && !((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-                               (*p >= '0' && *p <= '9') || *p == '_')) {
-            p++;
+    *truncated = false;
+    while (*p != '\0') {
+        while (*p != '\0' && !term_byte((unsigned char)*p)) p++;
+        const char *start = p;
+        while (*p != '\0' && term_byte((unsigned char)*p)) p++;
+        size_t len = (size_t)(p - start);
+        while (len > 0 && start[len - 1] == '.') len--;
+        if (len < 3) continue;
+        if (n == max_terms || used + len + 1 > bufsz) {
+            *truncated = true;
+            break;
         }
-        size_t start = used;
-        while (*p != '\0' && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-                              (*p >= '0' && *p <= '9') || *p == '_') &&
-               used + 1 < bufsz) {
-            char c = *p;
-            if (c >= 'A' && c <= 'Z') {
-                c = (char)(c - 'A' + 'a');
-            }
-            buf[used++] = c;
-            p++;
+        memcpy(buf + used, start, len);
+        buf[used + len] = '\0';
+        bool duplicate = false;
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(terms[i], buf + used) == 0) duplicate = true;
         }
-        buf[used++] = '\0';
-        if (used - start >= 4u) { /* three characters plus the NUL */
-            terms[n++] = buf + start;
-        } else {
-            used = start;
+        if (!duplicate) {
+            terms[n++] = buf + used;
+            used += len + 1;
         }
     }
     return n;
+}
+
+static bool generic_term(const char *term) {
+    static const char *const words[] = {
+        "the", "and", "for", "with", "from", "this", "that", "into", "how",
+        "find", "inspect", "improve", "change", "review", "explain", "task",
+        "function", "functions", "code", "please", "fix", "add", "update"
+    };
+    for (size_t i = 0; i < sizeof words / sizeof words[0]; i++) {
+        size_t n = strlen(term);
+        if (n != strlen(words[i])) continue;
+        bool equal = true;
+        for (size_t k = 0; k < n; k++) {
+            char c = term[k];
+            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            if (c != words[i][k]) equal = false;
+        }
+        if (equal) return true;
+    }
+    return false;
+}
+
+typedef struct context_seed {
+    char usr[ATLAS_SEM_MAX_USR_BYTES];
+    char name[ATLAS_SEM_MAX_NAME_BYTES];
+    char file[512];
+    bool lexical;
+} context_seed;
+
+typedef struct context_seeds {
+    context_seed *items;
+    size_t count;
+    bool lexical, truncated;
+} context_seeds;
+
+static atlas_status take_context_seed(const atlas_sem_symbol_row *row, void *ud,
+                                      atlas_err *err) {
+    (void)err;
+    context_seeds *s = ud;
+    for (size_t i = 0; i < s->count; i++) {
+        if (strcmp(s->items[i].usr, row->usr) == 0) {
+            if (!s->lexical) s->items[i].lexical = false;
+            return ATLAS_OK;
+        }
+    }
+    if (s->count == ATLAS_SEM_CONTEXT_MAX_SEEDS) {
+        s->truncated = true;
+        return ATLAS_OK;
+    }
+    context_seed *it = &s->items[s->count++];
+    (void)snprintf(it->usr, sizeof it->usr, "%s", row->usr);
+    (void)snprintf(it->name, sizeof it->name, "%s", row->name);
+    (void)snprintf(it->file, sizeof it->file, "%s", row->file_text);
+    it->lexical = s->lexical;
+    return ATLAS_OK;
+}
+
+/* Core validation also covers direct service callers, not only JSON adapters. */
+static atlas_status validate_seed_list(const char *p, size_t len, bool paths, atlas_err *err) {
+    if (len == 0) return ATLAS_OK;
+    if (p == NULL || len > ATLAS_SEM_CONTEXT_MAX_SEEDS * (size_t)ATLAS_SEM_MAX_NAME_BYTES) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "invalid context seed list");
+    }
+    size_t offset = 0, count = 0;
+    while (offset < len) {
+        const char *end = memchr(p + offset, '\0', len - offset);
+        size_t n = end != NULL ? (size_t)(end - (p + offset)) : 0;
+        if (end == NULL || n == 0 || n >= (paths ? 512u : ATLAS_SEM_MAX_NAME_BYTES) ||
+            ++count > ATLAS_SEM_CONTEXT_MAX_SEEDS) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "context seeds exceed their count or length bound");
+        }
+        if (paths) {
+            atlas_buf raw = ATLAS_BUF_INIT;
+            atlas_status st = atlas_path_text_decode(p + offset, n, &raw, err);
+            if (st == ATLAS_OK) st = atlas_path_check_relative(raw.data, raw.len, err);
+            atlas_buf_free(&raw);
+            if (st != ATLAS_OK) return st;
+        }
+        offset += n + 1;
+    }
+    return ATLAS_OK;
+}
+
+static atlas_status find_context_seed(atlas_db *db, int64_t gen, const char *term,
+                                      bool path, bool partial, context_seeds *seeds,
+                                      atlas_err *err) {
+    int64_t n = 0;
+    bool more = false;
+    seeds->lexical = partial;
+    atlas_status st;
+    if (path) {
+        st = atlas_db_sem_symbols_in_file(db, gen, term, ATLAS_SEM_MAX_ROWS,
+                                          take_context_seed, seeds, &n, &more, err);
+    } else if (partial) {
+        st = atlas_db_sem_symbols_matching(db, gen, term, ATLAS_SEM_MAX_ROWS,
+                                           take_context_seed, seeds, &n, &more, err);
+    } else {
+        st = atlas_db_sem_symbols_by_name(db, gen, term, NULL, NULL, ATLAS_SEM_MAX_ROWS,
+                                          take_context_seed, seeds, &n, &more, err);
+    }
+    seeds->truncated = seeds->truncated || more;
+    return st;
 }
 
 /* The `atlas_ctx` wrapper: resolve the repository, then run the same core. */
@@ -786,16 +1120,23 @@ atlas_status atlas_sem_context_on(atlas_db *db, const atlas_repo_info *repo,
     }
     (void)snprintf(out->task, sizeof out->task, "%s", req->task);
 
-    out->budget_bytes = req->max_bytes > 0 ? req->max_bytes
-                        : req->max_tokens > 0
-                            ? req->max_tokens * ATLAS_SEM_BYTES_PER_TOKEN
-                            : ATLAS_SEM_CONTEXT_DEFAULT_BYTES;
+    out->budget_bytes = ATLAS_SEM_CONTEXT_DEFAULT_BYTES;
+    if (req->max_bytes > 0) {
+        out->budget_bytes = req->max_bytes;
+    } else if (req->max_tokens > 0) {
+        /* Saturate before multiplying: a direct caller can supply INT64_MAX. */
+        out->budget_bytes = req->max_tokens >
+                                ATLAS_SEM_CONTEXT_MAX_BYTES / ATLAS_SEM_BYTES_PER_TOKEN
+                                ? ATLAS_SEM_CONTEXT_MAX_BYTES
+                                : req->max_tokens * ATLAS_SEM_BYTES_PER_TOKEN;
+    }
     if (out->budget_bytes > ATLAS_SEM_CONTEXT_MAX_BYTES) {
         out->budget_bytes = ATLAS_SEM_CONTEXT_MAX_BYTES;
     }
-    int64_t max_items = req->max_items > 0 && req->max_items < ATLAS_SEM_CONTEXT_MAX_ITEMS
-                            ? req->max_items
-                            : ATLAS_SEM_CONTEXT_MAX_ITEMS;
+    int64_t max_items = req->max_items > 0 ? req->max_items : ATLAS_SEM_CONTEXT_DEFAULT_ITEMS;
+    if (max_items > ATLAS_SEM_CONTEXT_MAX_ITEMS) {
+        max_items = ATLAS_SEM_CONTEXT_MAX_ITEMS;
+    }
 
     bool found = false;
     st = atlas_db_sem_current(db, out->repo.id, &out->generation, &found, err);
@@ -842,97 +1183,106 @@ atlas_status atlas_sem_context_on(atlas_db *db, const atlas_repo_info *repo,
         }
     }
 
-    char termbuf[ATLAS_SEM_CONTEXT_MAX_TASK_BYTES];
+    st = validate_seed_list(req->paths, req->paths_len, true, err);
+    if (st == ATLAS_OK) st = validate_seed_list(req->symbols, req->symbols_len, false, err);
+    if (st != ATLAS_OK) return st;
+    char termbuf[ATLAS_SEM_CONTEXT_MAX_TASK_BYTES + 1];
     const char *terms[ATLAS_SEM_CONTEXT_MAX_TERMS];
+    bool term_limit = false;
     size_t nterms = split_terms(req->task, termbuf, sizeof termbuf, terms,
-                                sizeof terms / sizeof terms[0]);
+                                sizeof terms / sizeof terms[0], &term_limit);
+    if (term_limit) note_missing(out, ATLAS_SEM_MISSING_SEARCH);
 
-    /* Seeds: what the caller named, then what the task's terms match. */
     atlas_sem_item *items = NULL;
-    size_t count = 0;
-    size_t cap = 0;
+    size_t count = 0, cap = 0;
     item_list list = {&items, &count, &cap};
     int64_t gen = out->generation.id;
     int64_t depth = req->depth > 0 ? req->depth : 2;
-    bool any_seed = false;
+    context_seeds seeds = {0};
+    seeds.items = calloc(ATLAS_SEM_CONTEXT_MAX_SEEDS, sizeof(*seeds.items));
+    if (seeds.items == NULL) return atlas_err_set(err, ATLAS_ERR_INTERNAL, "out of memory selecting seeds");
 
-    const char *p = req->symbols;
-    const char *end = found && p != NULL ? p + req->symbols_len : NULL;
-    while (st == ATLAS_OK && found && p != NULL && p < end && *p != '\0') {
+    const char *packed[] = {req->paths, req->symbols};
+    size_t lengths[] = {req->paths_len, req->symbols_len};
+    for (size_t k = 0; found && st == ATLAS_OK && k < 2; k++) {
+        for (size_t off = 0; off < lengths[k] && st == ATLAS_OK; off += strlen(packed[k] + off) + 1) {
+            st = find_context_seed(db, gen, packed[k] + off, k == 0, false, &seeds, err);
+        }
+    }
+    /* Explicit scope wins. Within prose, paths and exact identifiers precede
+     * lexical candidates; a partial match can never crowd out an exact one. */
+    if (found && req->paths_len == 0 && req->symbols_len == 0) {
+        for (size_t t = 0; t < nterms && st == ATLAS_OK; t++) {
+            bool path = strchr(terms[t], '/') != NULL || strchr(terms[t], '.') != NULL;
+            if (nterms > 1 && !path && generic_term(terms[t])) continue;
+            st = find_context_seed(db, gen, terms[t], path, false, &seeds, err);
+        }
+        if (seeds.count == 0) {
+            for (size_t t = 0; t < nterms && st == ATLAS_OK; t++) {
+                if (strchr(terms[t], '/') || strchr(terms[t], '.') || generic_term(terms[t])) continue;
+                st = find_context_seed(db, gen, terms[t], false, true, &seeds, err);
+            }
+        }
+    }
+    if (seeds.truncated) note_missing(out, ATLAS_SEM_MISSING_SEARCH);
+    if (found && seeds.count == 0) note_missing(out, ATLAS_SEM_MISSING_SEEDS);
+    for (size_t k = 0; k < seeds.count && st == ATLAS_OK; k++) {
         atlas_sem_impact_report imp;
         atlas_sem_impact_report_init(&imp);
-        atlas_err ignored;
-        atlas_err_init(&ignored);
-        if (atlas_sem_impact_on(db, &out->repo, p, depth, ATLAS_SEM_MAX_ROWS, &imp,
-                                &ignored) == ATLAS_OK &&
-            imp.subject_found) {
-            any_seed = true;
-            for (size_t i = 0; i < imp.count && st == ATLAS_OK; i++) {
-                atlas_sem_evidence ev = ATLAS_SEM_EV_UNKNOWN;
-                (void)atlas_sem_evidence_parse(imp.items[i].evidence, &ev);
-                st = item_add(&list, imp.items[i].kind, imp.items[i].name,
-                              imp.items[i].file_text, imp.items[i].line, ev, imp.items[i].why,
-                              imp.items[i].depth, err);
+        st = impact_at(db, &out->repo, seeds.items[k].name, seeds.items[k].usr,
+                        &out->generation, &out->trust, depth, ATLAS_SEM_MAX_ROWS, &imp, err);
+        if (st == ATLAS_OK && (imp.truncated || imp.unresolved_indirect > 0)) {
+            note_missing(out, ATLAS_SEM_MISSING_GRAPH);
+        }
+        for (size_t i = 0; i < imp.count && st == ATLAS_OK; i++) {
+            atlas_sem_evidence ev = ATLAS_SEM_EV_UNKNOWN;
+            (void)atlas_sem_evidence_parse(imp.items[i].evidence, &ev);
+            const char *why = imp.items[i].why;
+            if (seeds.items[k].lexical && strcmp(why, ATLAS_SEM_SEL_SUBJECT) == 0) {
+                why = ATLAS_SEM_SEL_TASK_MATCH;
+            }
+            size_t before = count;
+            st = item_add(&list, imp.items[i].kind, imp.items[i].name, imp.items[i].file_text,
+                          imp.items[i].line, ev, why, imp.items[i].depth, err);
+            if (st == ATLAS_OK && count > before && imp.items[i].test_classification[0] != '\0') {
+                items[before] = imp.items[i];
+                items[before].why = why;
             }
         }
         atlas_sem_impact_report_free(&imp);
-        p += strlen(p) + 1;
     }
-
-    /* No explicit seed: rank the whole symbol table by the task's terms.
-     * Bounded by the row ceiling, and the package says so when it finds
-     * nothing. */
-    if (st == ATLAS_OK && found && !any_seed) {
-        for (size_t t = 0; t < nterms && st == ATLAS_OK; t++) {
-            subject_sink probe;
-            memset(&probe, 0, sizeof(probe));
-            atlas_buf_init(&probe.seen);
-            int64_t n = 0;
-            bool tr = false;
-            atlas_err ignored;
-            atlas_err_init(&ignored);
-            bool hit = atlas_db_sem_symbols_by_name(db, gen, terms[t], NULL, NULL,
-                                                    4, take_subject, &probe, &n, &tr,
-                                                    &ignored) == ATLAS_OK &&
-                       probe.distinct > 0;
-            atlas_buf_free(&probe.seen);
-            if (!hit) {
-                continue;
-            }
-            any_seed = true;
-            /* A term that matched is expanded exactly as an explicitly named
-             * seed is. Adding the bare symbol and stopping there would produce
-             * a package listing names with no neighbourhood — which is the
-             * least useful thing this command could return, because a caller
-             * asking for context already knows the name they typed. */
-            atlas_sem_impact_report imp;
-            atlas_sem_impact_report_init(&imp);
-            atlas_err ignored2;
-            atlas_err_init(&ignored2);
-            if (atlas_sem_impact_on(db, &out->repo, terms[t], depth, ATLAS_SEM_MAX_ROWS,
-                                    &imp, &ignored2) == ATLAS_OK &&
-                imp.subject_found) {
-                for (size_t i = 0; i < imp.count && st == ATLAS_OK; i++) {
-                    atlas_sem_evidence ev = ATLAS_SEM_EV_UNKNOWN;
-                    (void)atlas_sem_evidence_parse(imp.items[i].evidence, &ev);
-                    st = item_add(&list, imp.items[i].kind, imp.items[i].name,
-                                  imp.items[i].file_text, imp.items[i].line, ev,
-                                  imp.items[i].why, imp.items[i].depth, err);
-                }
-            }
-            atlas_sem_impact_report_free(&imp);
+    for (size_t off = 0; st == ATLAS_OK && off < req->paths_len; off += strlen(req->paths + off) + 1) {
+        st = context_scope_add(db, req->paths + off, out, err);
+        if (st == ATLAS_OK) {
+            recorded_test_sink sink = {&list, req->paths + off, false};
+            bool more = false;
+            st = atlas_db_verify_tests_for_scope(db, out->repo.id, req->paths + off, "",
+                    ATLAS_SEM_CONTEXT_TEST_RECORDS, take_recorded_test, &sink, &more, err);
+            if (more || sink.omitted) note_missing(out, ATLAS_SEM_MISSING_TESTS);
         }
     }
-    if (found && !any_seed) {
-        /* Only when there was an index to search. With none, the missing index is
-         * the reason there are no seeds, and saying both would report one fact
-         * twice. */
-        note_missing(out, ATLAS_SEM_MISSING_SEEDS);
+    if (!found || seeds.count == 0) {
+        for (size_t off = 0; st == ATLAS_OK && off < req->symbols_len; off += strlen(req->symbols + off) + 1) {
+            recorded_test_sink sink = {&list, "", false};
+            bool more = false;
+            st = atlas_db_verify_tests_for_scope(db, out->repo.id, "", req->symbols + off,
+                    ATLAS_SEM_CONTEXT_TEST_RECORDS, take_recorded_test, &sink, &more, err);
+            if (more || sink.omitted) note_missing(out, ATLAS_SEM_MISSING_TESTS);
+        }
     }
+    for (size_t t = 0; st == ATLAS_OK && t < nterms; t++) {
+        if (strchr(terms[t], '/') || strchr(terms[t], '.')) st = context_scope_add(db, terms[t], out, err);
+    }
+    for (size_t k = 0; st == ATLAS_OK && k < seeds.count; k++) {
+        st = context_scope_add(db, seeds.items[k].file, out, err);
+    }
+    free(seeds.items);
 
     if (st == ATLAS_OK) {
         st = add_knowledge(db, req, out, &list, &count, err);
     }
+
+    note_missing(out, ATLAS_SEM_MISSING_TESTS);
 
     /* Rank, then fill to the budget. */
     if (st == ATLAS_OK && count > 0) {
@@ -946,18 +1296,27 @@ atlas_status atlas_sem_context_on(atlas_db *db, const atlas_repo_info *repo,
             r[i].score = score_of(&items[i], terms, nterms);
         }
         qsort(r, count, sizeof(*r), rank_cmp);
+        diversify(r, count);
 
-        for (size_t i = 0; i < count && (int64_t)out->count < max_items; i++) {
+        for (size_t i = 0; i < count; i++) {
+            if ((int64_t)out->count >= max_items) {
+                out->budget_reached = true;
+                note_missing(out, ATLAS_SEM_MISSING_ITEMS);
+                break;
+            }
             /* Each item costs what it will occupy: its name, its path and the
              * fixed labels around it. Counted rather than estimated, because a
              * budget that is not enforced is not a budget. */
             int64_t cost = (int64_t)(strlen(r[i].it->name) + strlen(r[i].it->file_text) +
                                      strlen(r[i].it->evidence) +
-                                     (r[i].it->why != NULL ? strlen(r[i].it->why) : 0) + 24);
+                                     (r[i].it->why != NULL ? strlen(r[i].it->why) : 0) +
+                                     strlen(r[i].it->test_classification) + strlen(r[i].it->test_suite) +
+                                     strlen(r[i].it->test_target) + strlen(r[i].it->test_result) +
+                                     strlen(r[i].it->test_commit) + strlen(r[i].it->test_evidence_uid) + 24);
             if (out->used_bytes + cost > out->budget_bytes) {
                 out->budget_reached = true;
                 note_missing(out, ATLAS_SEM_MISSING_BUDGET);
-                break;
+                continue;
             }
             if (out->count >= out->cap) {
                 size_t ncap = out->cap == 0 ? 64 : out->cap * 2;
@@ -995,11 +1354,17 @@ atlas_status atlas_sem_context_on(atlas_db *db, const atlas_repo_info *repo,
          * the trust facts, which for an unindexed repository say NO_GENERATION. */
         int64_t sem_items = 0;
         for (size_t i = 0; i < out->count; i++) {
-            if (strcmp(out->items[i].kind, "decision") != 0) {
+            if (strcmp(out->items[i].kind, "decision") != 0 && strcmp(out->items[i].kind, "test") != 0) {
                 sem_items++;
             }
         }
-        atlas_sem_trust_settle(&out->trust, sem_items, out->budget_reached);
+        bool incomplete = out->budget_reached;
+        for (size_t i = 0; i < out->missing_count; i++) {
+            if (strcmp(out->missing[i], ATLAS_SEM_MISSING_SEARCH) == 0 ||
+                strcmp(out->missing[i], ATLAS_SEM_MISSING_GRAPH) == 0) incomplete = true;
+        }
+        atlas_sem_trust_settle(&out->trust, sem_items, incomplete);
+        context_advice(out);
     }
     return st;
 }

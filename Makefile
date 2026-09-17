@@ -26,7 +26,7 @@ BUILD_TSAN    ?= build-tsan
 
 CTEST_FLAGS ?= --output-on-failure
 
-.PHONY: all release debug test test-debug smoke adversarial asan ubsan tsan verify-vendor install clean distclean doctor doctor-claude claude-install-test compiledb help
+.PHONY: all release debug test test-debug smoke benchmark-context adversarial asan ubsan tsan verify-vendor install clean distclean doctor doctor-claude claude-install-test compiledb help
 
 all: release
 
@@ -44,6 +44,10 @@ test: release
 # CLI smoke test. Uses the compiled JSON checker, not any language runtime.
 smoke: release
 	./scripts/smoke.sh $(BUILD_RELEASE)
+
+# Fixture-backed context profiles, CSV on stdout; no model or live daemon.
+benchmark-context: release
+	$(BUILD_RELEASE)/tests/test_context_benchmark
 
 # Adversarial git-hardening verification under strace.
 adversarial: release

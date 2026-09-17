@@ -1785,6 +1785,13 @@ instead of leaving it only in the round's own report.
 
 ## Claim text is bound with `strlen`, so an embedded NUL truncates it silently (2026-09-03)
 
+**Resolved 2026-09-14.** Verification intake refuses a proposition containing
+NUL before computing its content key or inserting a claim. The regression in
+`tests/test_verify_intake.c` covers leading, interior and trailing NUL bytes,
+checks that neither a claim nor an actor survives the refused transaction, and
+then successfully stores and reads ordinary UTF-8. Existing stored records are
+not rewritten. The following is the original finding and considered remedies.
+
 Found by A12.1's T17 while building the adversarial suite, which is why case (c) is split:
 the codec round-trip proves reversibility, and the full-pipeline case deliberately carries
 **no** embedded NUL because the pipeline would not have survived one.
@@ -2432,6 +2439,14 @@ section and `docs/decision-lifecycle.md` both state the gap; neither changes
 what the walker itself will do with a sheet built before this fix lands.
 
 ## Every MCP tool publishes `additionalProperties: false` but only one enforces it (2026-09-04)
+
+**Resolved 2026-09-14.** The common MCP dispatcher derives accepted keys from
+the same schema it publishes and refuses unknown or NUL-bearing keys before a
+handler runs. Visibility and scope checks still precede validation. The new
+`tests/test_mcp_arguments.c` tests every tool, including remote-only tools,
+and proves every published key can reach typed validation. Value types,
+required arguments and bounds remain checked by the existing readers. The
+following records the original finding and its history.
 
 Found during A14's T9 pass, when the comment at the top of
 `tests/test_decision_mcp.c` was corrected.

@@ -1,8 +1,8 @@
 # Operations: backup, verification, restore and retention
 
-Atlas is a local engineering-memory system. Its SQLite index is a *rebuildable*
-index of a repository — that is architecture invariant 1 and it still holds —
-but three kinds of thing in it cannot be rebuilt from any repository:
+Atlas is a local engineering-memory system. Its SQLite database holds
+rebuildable repository indexes alongside records that cannot be rebuilt from
+any repository, including:
 
 - **decision documents**, their immutable revisions and their append-only
   lifecycle ledger;

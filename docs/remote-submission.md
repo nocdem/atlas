@@ -181,8 +181,11 @@ of one of these names into `artifacts/` is overwritten rather than believed.
 `job.remote_artifact` renamed: **it takes no artifact parameter**, so "a caller
 may not name a file" is a property of the signature and of the gateway route
 row, not a check that could be forgotten. A worker's `logs/stdout.log` is
-reachable under no name. Nothing is applied, committed, approved or accepted;
-the method writes no row and starts no process.
+reachable through `job.remote_result` under no name, and the transcript itself
+is reachable from no remote route; A14R-F below returns a bounded tail of it
+through a separate method, and says exactly how much. Nothing is applied,
+committed, approved or accepted; the method writes no row and starts no
+process.
 
 *The bound that is a real bound.* Artifact bytes travel hex-encoded on the
 completion, and `ATLAS_IPC_MAX_REQUEST_BYTES` is 1 MiB, so every raw byte costs
@@ -349,7 +352,106 @@ worker's *final answer*, the patch, and Atlas' own gate verdicts. That is enough
 to review a proposal and not enough to audit how it was reached; a job that went
 wrong in the middle still has to be read on the Atlas machine, where the failed
 attempt's workspace is kept. This one is a stated cost with a real alternative
-behind it, which is what the original was not.
+behind it, which is what the original was not. **A14R-F narrows it** to the
+transcript's *middle*: the tail of it, and the dispatcher's own account of the
+failure, now travel — see the next section.
+
+## A14R-F — the failure a steward can read
+
+*The measured gap.* Job `j9409ede…` ended `FAILED` on 2026-09-07 with exit code
+143 and `exit_kind = CANCELLED`, one attempt, no artifact. `job.remote_result`
+answered `availability = terminal` and three unavailable slots, which is all it
+could say: the worker never wrote `result.txt`. The reason was in three places a
+remote steward cannot reach — the dispatcher's journal (`Stopping
+atlas-model-dispatcher.service` at 23:39:58Z: systemd restarting every unit
+after a local reinstall of the binary at 23:38:16Z, with no A17 deploy row and
+no deploy-agent journal for that window), the attempt's
+661 KB `logs/stdout.log` on the operator's machine, and the ledger's
+`exit_kind`, which `job.remote_get` does not report. A14R's `job.remote_result`
+was built for a worker that finished; a worker that never started, or was
+stopped in the middle, left a steward with a state and nothing behind it.
+
+*What it adds.* One method, one route, one MCP tool, no migration:
+
+| Surface | Name |
+| --- | --- |
+| daemon method (remote-submit group) | `job.remote_failure` |
+| gateway route | `POST /api/v1/job/failure`, body `job=<uid>` |
+| MCP tool (remote-only, `writes = false`) | `atlas_job_failure` |
+
+It takes the job and nothing else, under `job.remote_result`'s scope check
+verbatim — the submitting credential, and a repository the orchestration policy
+still permits — and answers at any state: a job that never reached an attempt
+answers with an empty attempt list and the absence stated, because a job nobody
+carried is exactly the one a steward asks "why" about. It returns:
+
+- **`attempts`** — every attempt's `exit_kind`, `exit_code`, `failure_reason`,
+  driver and version, event and artifact counts, from `orch_attempts`;
+- **`cause`** — one line Atlas composes from those closed vocabularies and the
+  newest transition reason; no worker prose enters it;
+- **`transitions`** — the job's ledger, in ledger order;
+- **`dispatcher_error`** — the newest `failure` event, when one was carried;
+- **`events`** — the newest `ATLAS_ORCH_FAILURE_EVENTS_MAX` events, the
+  worker-labelled narrative;
+- **`worker_log.stdout`** and **`worker_log.stderr`** — one parsed `log_tail`
+  event each.
+
+*Where the new bytes come from.* Nothing new is stored. The dispatcher, on an
+attempt that did not succeed, sends up to three ordinary events under its own
+lease before the completion — through the `dispatch.event` write point every
+event already uses, bounded at `ATLAS_ORCH_EVENT_MAX` as every event already is:
+
+- **`failure`**, only when the dispatcher knows something the exit
+  classification cannot say: the step that refused *before a worker existed*
+  (Atlas' own error text — a snapshot the daemon would not open, a workspace
+  that would not create); the stop signal that cancelled a running worker
+  (the `j9409ede…` class, named as a restart rather than a worker error); or
+  the failed gate, by index and argv, with the bounded redacted output
+  `atlas_validations_run` had always captured and this dispatcher had always
+  discarded. A plain non-zero exit sends none: the attempt row is the record.
+- **`log_tail`**, one per stream, the last `ATLAS_ORCH_LOG_TAIL_MAX` (6 KiB)
+  bytes of `logs/stdout.log` and `logs/stderr.log`, read back from the files
+  the driver stored **redacted** — never from the capture buffer — behind a
+  header the dispatcher composes: `stream`, `present`, `total_bytes`,
+  `tail_bytes`, `truncated`, `nul_replaced`, then a `--` line. Sent even when
+  the file does not exist (`present=no`), so a reader can tell "no log was
+  written" from "no dispatcher carried one".
+
+*What a reader is told, and never left to infer.* Each stream block carries
+`available`, and when false one of four reasons: the job never reached an
+attempt; the dispatcher that carried it sent no excerpt (it predates this, or
+stopped first — the log, if any, is in the kept workspace on the Atlas machine,
+which the daemon cannot read); the excerpt's header is not the grammar this
+daemon reads; or the driver wrote no such stream. When true it carries
+`total_bytes`, `tail_bytes` and `truncated`, so 6 KiB of a 661 KB log reads as
+6 KiB of a 661 KB log.
+
+*Why this is not `job.remote_log`.* That name was forbidden because "log" would
+hand over an unbounded transcript a caller selects. Here the caller selects
+nothing — no stream, no file, no attempt, no byte range — and the bound is not a
+check but the event ceiling every worker event already lives under. The daemon
+reads only the dispatcher's header and stops at its `--` line; the bytes after
+it are copied, safe-encoded and labelled `UNTRUSTED_DATA`, and no branch
+anywhere reads them, which keeps A10.1's "worker.log is never read" true. The
+name stays forbidden and `tests/test_orch_rpc.c` still scans for it.
+
+*Stated costs.* A job carried by a dispatcher older than this capability — every
+job before it, `j9409ede…` included — answers with the ledger and the stated
+absence, never a reconstructed log. A stop signal that arrives while the
+dispatcher is mid-send loses the sends; the completion that follows is the
+outcome and is still delivered. `op->failure_detail`, the gate excerpt a
+completion may carry, is still persisted for no job outside a run; the
+`failure` event is now the durable copy for a workspace job, and the write
+point was not touched. The full transcript is still reachable from no remote
+route.
+
+*Proved in `tests/test_gw_submit.c`* over the real socket, the real HTTP surface
+and the shipped dispatcher: a non-zero exit carries a tail and not the file
+(the head of the log is absent, `truncated = true`, `total_bytes > tail_bytes =
+6144`); a cancelled worker that wrote nothing answers `present = no` with its
+reason; a failed gate carries `gate 0 failed: false` as the dispatcher's own
+record; a second credential named by the same policy reads `no such job`; and
+`job.remote_result` still carries no worker log.
 
 ## 5. The cleartext chain, verbatim
 

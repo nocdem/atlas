@@ -987,3 +987,28 @@ bool atlas_sem_path_under_prefix(const char *packed_prefixes, const char *rel) {
     }
     return false;
 }
+
+/* Shared output-only guidance writer; no database or repository reads. */
+atlas_status atlas_sem_context_guidance_write_json(atlas_json *j,
+    const atlas_sem_context_report *r, atlas_err *err) {
+    atlas_status st = atlas_json_key(j, "scope", err);
+    if (st == ATLAS_OK) st = atlas_json_arr_begin(j, err);
+    for (size_t i = 0; st == ATLAS_OK && i < r->scope_count; i++) {
+        const atlas_sem_context_scope *f = &r->scope[i];
+        st = atlas_json_obj_begin(j, err);
+        if (st == ATLAS_OK) st = atlas_json_key_str(j, "path", f->path, err);
+        if (st == ATLAS_OK) st = atlas_json_key_bool(j, "in_file_index", f->in_file_index, err);
+        if (st == ATLAS_OK) st = atlas_json_key_int(j, "units", f->units, err);
+        if (st == ATLAS_OK) st = atlas_json_key_int(j, "complete_units", f->complete_units, err);
+        if (st == ATLAS_OK) st = atlas_json_obj_end(j, err);
+    }
+    if (st == ATLAS_OK) st = atlas_json_arr_end(j, err);
+    if (st == ATLAS_OK) st = atlas_json_key_bool(j, "scope_truncated", r->scope_truncated, err);
+    if (st == ATLAS_OK) st = atlas_json_key(j, "next_steps", err);
+    if (st == ATLAS_OK) st = atlas_json_arr_begin(j, err);
+    for (size_t i = 0; st == ATLAS_OK && i < r->next_step_count; i++) {
+        st = atlas_json_str(j, r->next_steps[i], err);
+    }
+    if (st == ATLAS_OK) st = atlas_json_arr_end(j, err);
+    return st;
+}

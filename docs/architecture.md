@@ -4,7 +4,7 @@
 
 ```
                       ┌──────────────┐
-   atlas CLI ────────►│   service    │◄──────── future: skill, MCP adapter
+   atlas CLI ────────►│   service    │◄──────── MCP / hooks / HTTP, via IPC
    (src/cli)          │ (src/core)   │
         │             └──────┬───────┘
         │                    │
@@ -16,13 +16,19 @@
                        typed operations         (source of truth)
                              │
                              ▼
-                        SQLite index
-                        (rebuildable)
+                        SQLite database
+                        indexes + records
 ```
 
-Data flows one way: Git and the working tree are read, facts are written to the
-index, and queries are answered from the index with provenance attached. Nothing
-flows back toward a repository.
+On the indexing path, Git and the working tree are read, facts are written to
+the index, and queries preserve provenance. MCP, hooks and the HTTP gateway
+reach the service through IPC. The daemon owns the writable database connection.
+
+Orchestration is a separate path: policy-authorized workers edit isolated
+workspaces or a specifically permitted repository tree. Confirmed deployment
+uses an external operator-installed agent. Neither capability is granted by
+index registration. See [orchestration](orchestration.md) and
+[remote deploy](remote-deploy.md) for those contracts.
 
 ## Layers
 
@@ -38,9 +44,13 @@ flows back toward a repository.
 | daemon | `src/daemon`, `src/ipc` | the writer thread, the worker pool, the watcher, the socket | answer a question the service layer has not been asked |
 | adapters | `src/ai`, `src/mcp`, `src/hook` | the A2 session service and the two Claude Code surfaces | open a database handle of their own (`src/mcp` and `src/hook` do not) |
 | code | `src/code` | the A3 lexical C indexer, compile-database reader, resolver and traversal | decide what a fact *means* — it records a resolution class and stops |
+| semantics | `src/sem` | compiler-derived facts, freshness, coverage and bounded task context | promote lexical candidates to compiler evidence |
+| knowledge | `src/decision`, `src/verify`, `src/gate`, `src/memory` | records, evidence, lifecycle, impact and reconciled context | treat a model assertion as verified project truth |
+| orchestration | `src/orch` | jobs, leases, workspaces, drivers, validation and plans | let worker output choose its own authority |
+| gateway | `src/gw` | scoped HTTP/MCP access and Mission Control | derive authority from a repository or request field |
 
 The service layer exists so that the CLI's human renderer, its JSON renderer, and
-any future adapter observe **identical** results. A renderer receives a service
+the adapters observe **identical** results. A renderer receives a service
 result and formats it; it cannot reach past the service to ask its own question.
 That is what makes "human and JSON cannot disagree" a structural property rather
 than a discipline.
@@ -50,8 +60,10 @@ than a discipline.
 These are the rules the code is built to keep. Where one is enforced in code
 rather than by convention, that is noted.
 
-1. **SQLite is a rebuildable index, never the canonical record of history.**
-   Deleting `atlas.db` loses nothing that cannot be recovered by rescanning.
+1. **Repository indexes are rebuildable; engineering records are not.** Git is
+   authoritative for source history. Decision revisions, lifecycle events,
+   attribution and other canonical records require backups; deleting `atlas.db`
+   loses them. See [operations](operations.md).
 2. **Git and repository contents are authoritative** for source and history
    facts. When the index and the repository disagree, the repository is right and
    `atlas status` reports the drift.
@@ -62,15 +74,16 @@ rather than by convention, that is noted.
 5. **A0 may create only `SOURCE` and `GIT` evidence.** Enforced in code:
    `atlas_db_evidence_insert` refuses any other kind with exit code 7, and a test
    asserts that no other kind can reach the table.
-6. **A0 never invents or infers a historical reason.** When a reason is
-   requested, the answer is `UNKNOWN`.
-7. **No Atlas command modifies a registered repository.** Enforced by an argv
-   allowlist checked before each `fork`, and proven by tree-digest tests.
+6. **Atlas never invents a historical reason.** It returns a recorded reason
+   with its provenance, or `UNKNOWN` when none was recorded.
+7. **Indexing never modifies a registered repository.** The read-only Git
+   allowlist and tree-digest tests enforce that boundary. Worker editing and
+   deployment require the separate authority described above.
 8. **Repository contents, filenames and Git metadata are untrusted input.**
 9. **All parsers use bounded memory and fail clearly on malformed input.**
 10. **Schema changes use numbered transactional migrations.**
 11. **Human and JSON modes consume the same service results.**
-12. **The CLI and future integrations share one service layer.**
+12. **The CLI and integrations share one service layer.**
 13. **A structural fact carries a resolution class, and the class is part of the
     fact.** Enforced in code: `resolution` is `NOT NULL` with a `CHECK`
     constraint, and `atlas_code_resolution_writable_in_a3` refuses
@@ -187,6 +200,12 @@ before the first entry and the summary after the last. That collection is bounde
 by `--limit` (default 2000 entries): past the ceiling the report sets `truncated`
 with a reason, while the per-scope counts still reflect reality, so the summary is
 never quietly wrong.
+
+## Historical layer additions
+
+The phase sections below describe the design when each layer was introduced.
+Statements about capabilities a phase lacked are historical; the current
+capabilities and invariants are described above and in the linked feature docs.
 
 ## A1: the daemon
 

@@ -10,14 +10,10 @@
  * So this asserts the *inventory* and the *schemas*: the exact set of tool
  * names, that none of them mentions an approval verb, and that no schema
  * declares a `token` or a `confirmation` argument. Every schema publishes
- * `additionalProperties: false`, but that is only enforced for five tools:
- * `run_job_submit` (T7, A14) and A17's four `run_deploy_*` forwarders all call
- * `atlas_jsonv_check_only_keys`. The other tools publish a claim the adapter
- * does not check — a documented bound that is not the implemented bound,
- * which is worse than no bound; `docs/backlog.md` carries the entry. The
- * forbidden-property test below is still meaningful: it
- * asserts the *schema* carries no approval property, even though the schema
- * alone does not stop a caller from sending one.
+ * `additionalProperties: false`; the shared dispatcher now enforces its keys
+ * before calling any handler. `test_mcp_arguments.c` exercises the behavioral
+ * half on both transports. The tests here retain the separate structural
+ * proof that no published argument grants an approval capability.
  *
  * The process runs with no database, no daemon and no repository: the tool
  * surface is a property of the binary, and asking about it must not require any
@@ -398,6 +394,7 @@ static void test_no_source_or_document_overstates_the_approval_claim(void) {
         ATLAS_SRC_DIR "/README.md",
         ATLAS_SRC_DIR "/SECURITY.md",
         ATLAS_SRC_DIR "/CLAUDE.md",
+        ATLAS_SRC_DIR "/docs/agent-reference.md",
         ATLAS_SRC_DIR "/docs/decision-lifecycle.md",
         ATLAS_SRC_DIR "/docs/review-surface.md",
         ATLAS_SRC_DIR "/docs/ai-trust-boundary.md",
@@ -412,6 +409,16 @@ static void test_no_source_or_document_overstates_the_approval_claim(void) {
         ATLAS_SRC_DIR "/src/core/terminal.c",
         ATLAS_SRC_DIR "/src/core/service_decision.c",
         ATLAS_SRC_DIR "/src/mcp/mcp_tools.c",
+        ATLAS_SRC_DIR "/src/mcp/mcp_tools_internal.h",
+        ATLAS_SRC_DIR "/src/mcp/mcp_tools_common.c",
+        ATLAS_SRC_DIR "/src/mcp/mcp_tools_read.c",
+        ATLAS_SRC_DIR "/src/mcp/mcp_tools_code.c",
+        ATLAS_SRC_DIR "/src/mcp/mcp_tools_memory.c",
+        ATLAS_SRC_DIR "/src/mcp/mcp_tools_gate.c",
+        ATLAS_SRC_DIR "/src/mcp/mcp_tools_sem.c",
+        ATLAS_SRC_DIR "/src/mcp/mcp_tools_verify.c",
+        ATLAS_SRC_DIR "/src/mcp/mcp_tools_jobs.c",
+        ATLAS_SRC_DIR "/src/mcp/mcp_tools_deploy.c",
         ATLAS_SRC_DIR "/src/cli/render_human.c",
         ATLAS_SRC_DIR "/src/gw/ui/mission-control.html",
         ATLAS_SRC_DIR "/src/core/service_review.c",
@@ -665,6 +672,7 @@ static void test_the_repository_identity_is_described_accurately(void) {
         ATLAS_SRC_DIR "/README.md",
         ATLAS_SRC_DIR "/SECURITY.md",
         ATLAS_SRC_DIR "/CLAUDE.md",
+        ATLAS_SRC_DIR "/docs/agent-reference.md",
         ATLAS_SRC_DIR "/docs/decision-lifecycle.md",
         ATLAS_SRC_DIR "/docs/data-model.md",
         ATLAS_SRC_DIR "/docs/architecture.md",
@@ -691,6 +699,7 @@ static void test_the_repository_identity_is_described_accurately(void) {
         ATLAS_SRC_DIR "/README.md",
         ATLAS_SRC_DIR "/SECURITY.md",
         ATLAS_SRC_DIR "/CLAUDE.md",
+        ATLAS_SRC_DIR "/docs/agent-reference.md",
         ATLAS_SRC_DIR "/docs/decision-lifecycle.md",
         ATLAS_SRC_DIR "/docs/data-model.md",
         ATLAS_SRC_DIR "/src/db/db_decision.c",

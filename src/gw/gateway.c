@@ -1078,6 +1078,12 @@ static const api_route API_WRITE_ROUTES[] = {
      * three files it can return are fixed by the daemon and not by a request. */
     {"/api/v1/job/result", "job.remote_result", ATLAS_SCOPE_JOBS_SUBMIT,
      {"job", NULL}, {NULL}, ATLAS_GW_WRITE_BODY_MAX_BYTES},
+    /* A14R-F. Why a job did not succeed: the ledger, the dispatcher's own
+     * failure record and a bounded tail of the redacted worker log, all read
+     * from rows the daemon already holds. The job and nothing else, for the
+     * reason the row above gives. */
+    {"/api/v1/job/failure", "job.remote_failure", ATLAS_SCOPE_JOBS_SUBMIT,
+     {"job", NULL}, {NULL}, ATLAS_GW_WRITE_BODY_MAX_BYTES},
     {"/api/v1/job/list", "job.remote_list", ATLAS_SCOPE_JOBS_SUBMIT,
      {"after", "limit", NULL}, {"after", "limit", NULL}, ATLAS_GW_WRITE_BODY_MAX_BYTES},
     {"/api/v1/job/cancel", "job.remote_cancel", ATLAS_SCOPE_JOBS_SUBMIT,

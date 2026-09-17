@@ -1,0 +1,79 @@
+name: C build and tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: atlas-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: ${{ matrix.profile }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: release
+            build_type: Release
+            flags: ''
+          - profile: no-libclang
+            build_type: Release
+            flags: -DATLAS_WITH_LIBCLANG=OFF
+          - profile: asan-ubsan
+            build_type: Debug
+            flags: -DATLAS_ASAN=ON -DATLAS_UBSAN=ON
+          - profile: tsan
+            build_type: Debug
+            flags: -DATLAS_TSAN=ON
+    env:
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+      TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential cmake pkg-config libsqlite3-dev libclang-dev git
+      - name: Verify vendored source
+        run: ./scripts/verify_third_party.sh
+      - name: Configure
+        run: cmake -S . -B build-ci -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DATLAS_WERROR=ON ${{ matrix.flags }}
+      - name: Build
+        run: cmake --build build-ci --parallel 4
+      - name: Full regression suite
+        if: matrix.profile == 'release'
+        run: ctest --test-dir build-ci --output-on-failure --no-tests=error --parallel 4
+      - name: Unit checks under alternate configurations
+        if: matrix.profile != 'release' && matrix.profile != 'tsan'
+        run: ctest --test-dir build-ci -L unit --output-on-failure --no-tests=error --parallel 4
+      - name: CLI and semantic integration checks
+        if: matrix.profile == 'asan-ubsan'
+        run: ctest --test-dir build-ci -R '^(test_cli|test_sem|test_sem_trust|test_context_benchmark)$' --output-on-failure --no-tests=error
+      - name: CLI and unavailable-compiler checks
+        if: matrix.profile == 'no-libclang'
+        run: ctest --test-dir build-ci -R '^(test_cli|test_sem|test_context_benchmark)$' --output-on-failure --no-tests=error
+      - name: Threaded writer and watcher checks
+        if: matrix.profile == 'tsan'
+        run: ctest --test-dir build-ci -R '^(test_lock|test_watch_budget|test_daemon)$' --output-on-failure --no-tests=error
+      - name: CLI smoke checks
+        if: matrix.profile == 'release'
+        run: ./scripts/smoke.sh build-ci
+      - name: Preserve test diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-logs-${{ matrix.profile }}
+          path: build-ci/Testing/Temporary/
+          if-no-files-found: ignore
+          retention-days: 14

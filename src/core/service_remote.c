@@ -3770,6 +3770,12 @@ static void take_items(const atlas_ipc_response *r, atlas_sem_item **items, size
         if (atlas_ipc_result_arr_obj_int(r, "items", i, "depth", &t)) {
             it->depth = t;
         }
+        if (atlas_ipc_result_arr_obj_str(r, "items", i, "test_classification", &v)) copy_str(it->test_classification, sizeof it->test_classification, v);
+        if (atlas_ipc_result_arr_obj_str(r, "items", i, "test_suite", &v)) copy_str(it->test_suite, sizeof it->test_suite, v);
+        if (atlas_ipc_result_arr_obj_str(r, "items", i, "test_target", &v)) copy_str(it->test_target, sizeof it->test_target, v);
+        if (atlas_ipc_result_arr_obj_str(r, "items", i, "test_result", &v)) copy_str(it->test_result, sizeof it->test_result, v);
+        if (atlas_ipc_result_arr_obj_str(r, "items", i, "test_commit", &v)) copy_str(it->test_commit, sizeof it->test_commit, v);
+        if (atlas_ipc_result_arr_obj_str(r, "items", i, "test_evidence_uid", &v)) copy_str(it->test_evidence_uid, sizeof it->test_evidence_uid, v);
         (*count)++;
     }
 }
@@ -3865,6 +3871,27 @@ atlas_status atlas_service_sem_context_remote(const atlas_sem_context_req *req,
         if (st == ATLAS_OK) {
             st = atlas_json_key_str(j, "task", req->task, err);
         }
+        const char *lists[] = {req->paths, req->symbols};
+        const size_t lengths[] = {req->paths_len, req->symbols_len};
+        const char *keys[] = {"paths", "symbols"};
+        for (size_t k = 0; st == ATLAS_OK && k < 2; k++) {
+            if (lengths[k] == 0) continue;
+            st = atlas_json_key(j, keys[k], err);
+            if (st == ATLAS_OK) st = atlas_json_arr_begin(j, err);
+            for (size_t off = 0; st == ATLAS_OK && off < lengths[k];) {
+                const char *end = lists[k] != NULL ? memchr(lists[k] + off, '\0', lengths[k] - off) : NULL;
+                if (end == NULL) {
+                    st = atlas_err_set(err, ATLAS_ERR_USAGE, "invalid context seed list");
+                    break;
+                }
+                st = atlas_json_str(j, lists[k] + off, err);
+                off = (size_t)(end - lists[k]) + 1;
+            }
+            if (st == ATLAS_OK) st = atlas_json_arr_end(j, err);
+        }
+        if (st == ATLAS_OK && req->include_history) {
+            st = atlas_json_key_bool(j, "include_history", true, err);
+        }
         if (st == ATLAS_OK && req->depth > 0) {
             st = atlas_json_key_int(j, "depth", req->depth, err);
         }
@@ -3921,12 +3948,14 @@ atlas_status atlas_service_sem_context_remote(const atlas_sem_context_req *req,
     static const char *const MISSING[] = {
         ATLAS_SEM_MISSING_INDEX,    ATLAS_SEM_MISSING_STALE,     ATLAS_SEM_MISSING_SEEDS,
         ATLAS_SEM_MISSING_BUDGET,   ATLAS_SEM_MISSING_DECISIONS,
+        ATLAS_SEM_MISSING_ITEMS, ATLAS_SEM_MISSING_SEARCH, ATLAS_SEM_MISSING_GRAPH,
+        ATLAS_SEM_MISSING_KNOWLEDGE, ATLAS_SEM_MISSING_TESTS,
         /* A9.2.5. Added here as well as at the producer: a reason that is not in
          * this set crosses the socket and becomes absent, so a note the daemon
          * emits and this array does not know is a gap the CLI silently drops. */
         ATLAS_SEM_MISSING_COVERAGE, ATLAS_SEM_MISSING_DISCOVERY,
     };
-    for (size_t i = 0; i < n && out->missing_count < 8u; i++) {
+    for (size_t i = 0; i < n && out->missing_count < sizeof out->missing / sizeof out->missing[0]; i++) {
         if (!atlas_ipc_result_arr_str(r, "not_included", i, &v)) {
             continue;
         }
@@ -3935,6 +3964,24 @@ atlas_status atlas_service_sem_context_remote(const atlas_sem_context_req *req,
                 out->missing[out->missing_count++] = MISSING[k];
                 break;
             }
+        }
+    }
+    (void)atlas_ipc_result_arr_len(r, "scope", &n);
+    out->scope_truncated = n > ATLAS_SEM_CONTEXT_MAX_SCOPE;
+    if (atlas_ipc_result_bool(r, "scope_truncated", &b) && b) out->scope_truncated = true;
+    for (size_t i = 0; i < n && out->scope_count < ATLAS_SEM_CONTEXT_MAX_SCOPE; i++) {
+        if (!atlas_ipc_result_arr_obj_str(r, "scope", i, "path", &v) || strlen(v) >= sizeof out->scope[0].path) continue;
+        atlas_sem_context_scope *f = &out->scope[out->scope_count++];
+        copy_str(f->path, sizeof f->path, v);
+        (void)atlas_ipc_result_arr_obj_bool(r, "scope", i, "in_file_index", &f->in_file_index);
+        (void)atlas_ipc_result_arr_obj_int(r, "scope", i, "units", &f->units);
+        (void)atlas_ipc_result_arr_obj_int(r, "scope", i, "complete_units", &f->complete_units);
+    }
+    (void)atlas_ipc_result_arr_len(r, "next_steps", &n);
+    for (size_t i = 0; i < n && out->next_step_count < ATLAS_SEM_CONTEXT_MAX_GAPS; i++) {
+        if (atlas_ipc_result_arr_str(r, "next_steps", i, &v)) {
+            const char *advice = atlas_sem_context_advice_intern(v);
+            if (advice != NULL) out->next_steps[out->next_step_count++] = advice;
         }
     }
     atlas_ipc_response_free(r);

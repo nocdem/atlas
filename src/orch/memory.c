@@ -13,6 +13,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include "atlas/pathrep.h"
 
 #include "atlas/safetext.h"
 #include "atlas/sha256.h"
@@ -218,10 +219,124 @@ static bool tokenset_has(const tokenset *s, const char *t) {
     return false;
 }
 
+static int64_t shared_tokens(const tokenset *want, const atlas_buf *field) {
+    tokenset have;
+    tokenize(atlas_buf_cstr(field), &have);
+    int64_t n = 0;
+    for (size_t i = 0; i < have.n; i++) if (tokenset_has(want, have.t[i])) n++;
+    return n;
+}
+
+/* A patch is evidence of proposed workspace changes, not of deployment. Read
+ * headers only between diff and hunk markers so added source text cannot
+ * masquerade as a second path. No patch body is retained in the package. */
+atlas_status atlas_orch_memory_patch_paths(const void *data, size_t len, atlas_buf *paths,
+                                           bool *incomplete, atlas_err *err) {
+    atlas_buf_reset(paths);
+    *incomplete = false;
+    if ((data == NULL && len != 0) || len > ATLAS_ORCH_MEMORY_PATCH_SCAN_MAX) {
+        *incomplete = true;
+        return ATLAS_OK;
+    }
+    const unsigned char *bytes = data;
+    atlas_buf seen = ATLAS_BUF_INIT;
+    bool headers = false, saw_diff = false, saw_path = false;
+    size_t count = 0;
+    atlas_status st = ATLAS_OK;
+    for (size_t off = 0; off < len && st == ATLAS_OK;) {
+        const unsigned char *nl = memchr(bytes + off, '\n', len - off);
+        size_t end = nl != NULL ? (size_t)(nl - bytes) : len;
+        const unsigned char *line = bytes + off;
+        size_t n = end - off;
+        off = end < len ? end + 1 : end;
+        if (n >= 11 && memcmp(line, "diff --git ", 11) == 0) {
+            if (saw_diff && !saw_path) *incomplete = true;
+            saw_diff = true;
+            saw_path = false;
+            headers = true;
+            continue;
+        }
+        if (n >= 2 && memcmp(line, "@@", 2) == 0) headers = false;
+        if (n >= 16 && memcmp(line, "GIT binary patch", 16) == 0) {
+            headers = false;
+            *incomplete = true;
+        }
+        if (n >= 13 && memcmp(line, "Binary files ", 13) == 0) *incomplete = true;
+        if (!headers || n < 4 || (memcmp(line, "--- ", 4) && memcmp(line, "+++ ", 4))) continue;
+        const unsigned char *p = line + 4;
+        size_t pn = n - 4;
+        if (pn == 9 && memcmp(p, "/dev/null", 9) == 0) continue;
+        atlas_buf raw = ATLAS_BUF_INIT, text = ATLAS_BUF_INIT;
+        bool valid = true;
+        if (pn >= 2 && p[0] == '"' && p[pn - 1] == '"') {
+            for (size_t i = 1; i + 1 < pn && st == ATLAS_OK; i++) {
+                unsigned char c = p[i];
+                if (c == '\\') {
+                    if (++i + 1 >= pn) { valid = false; break; }
+                    c = p[i];
+                    if (c >= '0' && c <= '7') {
+                        if (i + 3 >= pn || p[i+1] < '0' || p[i+1] > '7' ||
+                            p[i+2] < '0' || p[i+2] > '7') { valid = false; break; }
+                        unsigned value = (unsigned)(c - '0') * 64u + (unsigned)(p[i+1] - '0') * 8u +
+                                         (unsigned)(p[i+2] - '0');
+                        if (value > 255u) { valid = false; break; }
+                        c = (unsigned char)value;
+                        i += 2;
+                    } else {
+                        switch (c) {
+                            case 'n': c = '\n'; break;
+                            case 'r': c = '\r'; break;
+                            case 't': c = '\t'; break;
+                            case 'b': c = '\b'; break;
+                            case 'f': c = '\f'; break;
+                            case 'v': c = '\v'; break;
+                            case 'a': c = '\a'; break;
+                            case '\\': case '"': break;
+                            default: valid = false; break;
+                        }
+                    }
+                }
+                if (!valid) break;
+                st = atlas_buf_append(&raw, &c, 1, err);
+            }
+        } else {
+            st = atlas_buf_set(&raw, p, pn, err);
+        }
+        if (raw.len < 3 || (raw.data[0] != 'a' && raw.data[0] != 'b') || raw.data[1] != '/') valid = false;
+        atlas_err ignored;
+        atlas_err_init(&ignored);
+        if (valid && atlas_path_check_relative(raw.data + 2, raw.len - 2, &ignored) != ATLAS_OK) valid = false;
+        if (valid && st == ATLAS_OK) st = atlas_path_text_encode(raw.data + 2, raw.len - 2, &text, err);
+        if (!valid) *incomplete = true;
+        if (valid && st == ATLAS_OK) {
+            saw_path = true;
+            bool duplicate = false;
+            for (size_t pos = 0; pos < seen.len; pos += strlen(seen.data + pos) + 1) {
+                if (strcmp(seen.data + pos, atlas_buf_cstr(&text)) == 0) duplicate = true;
+            }
+            if (!duplicate) {
+                if (count == ATLAS_ORCH_MEMORY_PATHS_MAX || paths->len + text.len + 1 > ATLAS_ORCH_MEMORY_FILES_MAX) {
+                    *incomplete = true;
+                } else {
+                    st = atlas_buf_append(&seen, text.data, text.len + 1, err);
+                    if (st == ATLAS_OK) st = atlas_buf_append(paths, text.data, text.len, err);
+                    if (st == ATLAS_OK) st = atlas_buf_append_ch(paths, '\n', err);
+                    count++;
+                }
+            }
+        }
+        atlas_buf_free(&raw);
+        atlas_buf_free(&text);
+    }
+    atlas_buf_free(&seen);
+    if ((saw_diff && !saw_path) || (len != 0 && paths->len == 0)) *incomplete = true;
+    return st;
+}
+
 /* --- scoring and ordering -------------------------------------------------- */
 
-/* The commit relation's contribution. EXACT is worth more than three shared
- * tokens on purpose: a run recorded against the very commit this task is pinned
+/* The commit relation's contribution. EXACT is worth four goal-token matches:
+ * a run recorded against the very commit this task is pinned
  * to described the same tree, which no amount of vocabulary overlap
  * establishes. INDEXED is worth one, and it is not an ancestry claim. */
 static int64_t rel_bonus(atlas_orch_memory_commit_rel r) {
@@ -359,6 +474,20 @@ static atlas_status render_one(atlas_buf *out, const atlas_orch_memory_cand *c, 
                                (long long)c->worker_starts, (long long)c->task_count);
     }
     if (st == ATLAS_OK) {
+        st = atlas_buf_appendf(out, err,
+            "    selection: lexical-v2 goal=%lld gates=%lld failure=%lld paths=%lld\n",
+            (long long)c->goal_overlap, (long long)c->gate_overlap,
+            (long long)c->failure_overlap, (long long)c->path_overlap);
+    }
+    if (st == ATLAS_OK && c->files.len > 0) {
+        st = atlas_buf_append_str(out, "    last stored patch paths (historical hints): ", err);
+        if (st == ATLAS_OK) st = put_untrusted_flat(out, &c->files, ATLAS_ORCH_MEMORY_FILES_MAX, err);
+        if (st == ATLAS_OK) st = atlas_buf_append_str(out, "\n", err);
+    }
+    if (st == ATLAS_OK && c->files_incomplete) {
+        st = atlas_buf_append_str(out, "    patch path hints are incomplete\n", err);
+    }
+    if (st == ATLAS_OK) {
         st = atlas_buf_append_str(out, "    goal (UNTRUSTED HISTORICAL OUTPUT): ", err);
     }
     if (st == ATLAS_OK) {
@@ -396,7 +525,7 @@ static atlas_status render_one(atlas_buf *out, const atlas_orch_memory_cand *c, 
         }
     }
     if (st == ATLAS_OK && c->detail.len > 0) {
-        st = atlas_buf_append_str(out, "    proved failure (UNTRUSTED HISTORICAL OUTPUT): ", err);
+        st = atlas_buf_append_str(out, "    recorded gate output (UNTRUSTED HISTORICAL OUTPUT): ", err);
         if (st == ATLAS_OK) {
             st = put_untrusted_flat(out, &c->detail, ATLAS_ORCH_MEMORY_DETAIL_MAX, err);
         }
@@ -488,20 +617,22 @@ atlas_status atlas_orch_memory_build(atlas_orch_memory_mode mode, const char *ta
     tokenize(task_text, &want);
 
     for (size_t i = 0; i < n; i++) {
-        tokenset have;
-        tokenize(atlas_buf_cstr(&cands[i].goal), &have);
-        int64_t overlap = 0;
-        for (size_t k = 0; k < have.n; k++) {
-            if (tokenset_has(&want, have.t[k])) {
-                overlap++;
-            }
-        }
-        if (current_commit != NULL && current_commit[0] != '\0' &&
-            strcmp(current_commit, cands[i].source_commit) == 0) {
-            cands[i].rel = ATLAS_ORCH_MEMORY_COMMIT_EXACT;
-        }
-        cands[i].overlap = overlap;
-        cands[i].score = overlap + rel_bonus(cands[i].rel);
+        atlas_orch_memory_cand *c = &cands[i];
+        c->goal_overlap = shared_tokens(&want, &c->goal);
+        c->gate_overlap = shared_tokens(&want, &c->gates);
+        c->failure_overlap = shared_tokens(&want, &c->detail);
+        c->path_overlap = shared_tokens(&want, &c->files);
+        c->rel = current_commit != NULL && current_commit[0] != '\0' &&
+                 strcmp(current_commit, c->source_commit) == 0
+                     ? ATLAS_ORCH_MEMORY_COMMIT_EXACT
+                     : c->rel == ATLAS_ORCH_MEMORY_COMMIT_EXACT
+                         ? ATLAS_ORCH_MEMORY_COMMIT_UNKNOWN : c->rel;
+        /* Repetition within one field never votes twice. Failure/test/path
+         * matches get more weight than goal prose; they remain historical
+         * hints and do not alter acceptance or verification. */
+        c->overlap = c->goal_overlap + c->gate_overlap + c->failure_overlap + c->path_overlap;
+        c->score = c->goal_overlap + 2 * c->gate_overlap + 2 * c->failure_overlap +
+                   3 * c->path_overlap + rel_bonus(c->rel);
     }
     cand_sort(cands, n);
 

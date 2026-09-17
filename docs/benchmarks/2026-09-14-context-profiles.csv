@@ -1,0 +1,11 @@
+category,profile,samples,p50_us,p95_us,items,used_bytes,wire_bytes,budget_reached
+known-symbol,previous-defaults,11,26418,27872,1,68,1272,false
+known-symbol,compact-defaults,11,26164,36383,1,68,1271,false
+cross-file,previous-defaults,11,28032,28256,81,6385,12141,false
+cross-file,compact-defaults,11,27937,29365,24,1882,4447,true
+broad-handoff,previous-defaults,11,28593,29221,82,6453,12293,false
+broad-handoff,compact-defaults,11,28537,28774,24,1871,4463,true
+prefix-only-gap,previous-defaults,11,25105,25707,0,0,1250,false
+prefix-only-gap,compact-defaults,11,25330,25717,0,0,1249,false
+missing-evidence,previous-defaults,11,25491,34425,0,0,1245,false
+missing-evidence,compact-defaults,11,25517,26316,0,0,1244,false

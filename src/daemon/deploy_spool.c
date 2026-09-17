@@ -799,7 +799,11 @@ atlas_status atlas_deploy_ingest_pass(atlas_db *db, const char *data_dir, FILE *
     struct dirent *de;
     while (n < ATLAS_DEPLOY_INGEST_MAX_FILES && (de = readdir(d)) != NULL) {
         if (is_res_filename(de->d_name)) {
-            (void)snprintf(names[n], sizeof names[n], "%s", de->d_name);
+            size_t name_len = strlen(de->d_name);
+            if (name_len >= sizeof names[n]) {
+                continue;
+            }
+            memcpy(names[n], de->d_name, name_len + 1u);
             n++;
         }
     }

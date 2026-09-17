@@ -407,9 +407,10 @@ atlas_status atlas_jsonv_check_only_keys(const atlas_jsonv *obj,
     yyjson_obj_iter_init(as_val(obj), &it);
     yyjson_val *key;
     while ((key = yyjson_obj_iter_next(&it)) != NULL) {
-        const char *k = yyjson_get_str(key);
-        if (k == NULL) {
-            continue;
+        const char *k = NULL;
+        if (!atlas_jsonv_str((const atlas_jsonv *)key, &k, NULL)) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "an argument name contains an embedded NUL");
         }
         bool found = false;
         for (size_t i = 0; allowed[i] != NULL; i++) {
@@ -421,6 +422,36 @@ atlas_status atlas_jsonv_check_only_keys(const atlas_jsonv *obj,
         if (!found) {
             return atlas_err_set(err, ATLAS_ERR_USAGE,
                                  "\"%s\" is not a recognised argument", k);
+        }
+    }
+    return ATLAS_OK;
+}
+
+atlas_status atlas_jsonv_check_properties(const atlas_jsonv *obj,
+                                          const atlas_jsonv *properties,
+                                          atlas_err *err) {
+    if (!atlas_jsonv_is_obj(properties)) {
+        return atlas_err_set(err, ATLAS_ERR_INTERNAL,
+                             "the tool schema has no properties object");
+    }
+    if (obj == NULL) {
+        return ATLAS_OK;
+    }
+    if (!atlas_jsonv_is_obj(obj)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "arguments must be an object");
+    }
+    yyjson_obj_iter it;
+    yyjson_obj_iter_init(as_val(obj), &it);
+    yyjson_val *key;
+    while ((key = yyjson_obj_iter_next(&it)) != NULL) {
+        const char *name = NULL;
+        if (!atlas_jsonv_str((const atlas_jsonv *)key, &name, NULL)) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "an argument name contains an embedded NUL");
+        }
+        if (atlas_jsonv_get(properties, name) == NULL) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE,
+                                 "\"%s\" is not a recognised argument", name);
         }
     }
     return ATLAS_OK;

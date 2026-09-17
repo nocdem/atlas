@@ -1673,6 +1673,16 @@ atlas_status atlas_db_verify_claims_for_repo(atlas_db *db, int64_t repo_id, int6
                                              atlas_verify_claim_cb cb, void *ctx,
                                              bool *truncated_out, atlas_err *err);
 
+/* Borrowed historical TEST evidence bound to an exact path or symbol. Selection
+ * does not authenticate the record or promote its result to a current fact. */
+typedef struct atlas_verify_test_row {
+    const char *uid, *path, *suite, *name, *result, *commit;
+} atlas_verify_test_row;
+typedef atlas_status (*atlas_verify_test_cb)(const atlas_verify_test_row *, void *, atlas_err *);
+atlas_status atlas_db_verify_tests_for_scope(atlas_db *db, int64_t repo_id,
+    const char *path, const char *symbol, int64_t limit, atlas_verify_test_cb cb,
+    void *ud, bool *more, atlas_err *err);
+
 atlas_status atlas_db_verify_evidence_insert(atlas_db *db, atlas_verify_evidence *e,
                                              const char *now, atlas_err *err);
 atlas_status atlas_db_verify_evidence_dep_add(atlas_db *db, int64_t evidence_id,

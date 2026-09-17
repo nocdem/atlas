@@ -94,11 +94,18 @@ const char *atlas_jsonv_str_member2(const atlas_jsonv *obj, const char *k1, cons
  * Returns ATLAS_OK when all keys are recognised. Returns ATLAS_ERR_USAGE and
  * sets `err` when a key is absent from the list.
  *
- * Call this in a run function to enforce `additionalProperties: false` at
- * runtime: the MCP layer publishes that constraint in the schema JSON but does
- * not validate it before calling run(). */
+ * Used for explicit protocol allowlists. MCP also checks the published schema
+ * centrally before calling a tool's run function. */
 atlas_status atlas_jsonv_check_only_keys(const atlas_jsonv *obj,
                                          const char *const *allowed,
                                          atlas_err *err);
+
+/* The same key check against the keys of a schema's `properties` object.
+ * Values in `properties` are declarations, not validators: required fields,
+ * types and value bounds remain the responsibility of the typed reader.
+ * Missing arguments are an empty object. Embedded NUL keys are refused. */
+atlas_status atlas_jsonv_check_properties(const atlas_jsonv *obj,
+                                          const atlas_jsonv *properties,
+                                          atlas_err *err);
 
 #endif /* ATLAS_JSONREAD_H */

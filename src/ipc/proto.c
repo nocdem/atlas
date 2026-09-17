@@ -230,6 +230,10 @@ const char *atlas_ipc_request_method(const atlas_ipc_request *req) {
     return req->method;
 }
 
+bool atlas_ipc_param_present(const atlas_ipc_request *req, const char *key) {
+    return req != NULL && req->params != NULL && yyjson_obj_get(req->params, key) != NULL;
+}
+
 bool atlas_ipc_param_str(const atlas_ipc_request *req, const char *key, const char **out) {
     *out = NULL;
     if (req->params == NULL) {

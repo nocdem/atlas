@@ -865,6 +865,13 @@ static atlas_status write_items(dispatch_state *ds, const atlas_sem_item *items,
         if (st == ATLAS_OK) {
             st = atlas_json_key_int(ds->j, "depth", it->depth, err);
         }
+        if (st == ATLAS_OK && it->test_classification[0] != '\0') st = atlas_json_key_str(ds->j, "test_classification", atlas_safe(&ds->safe, it->test_classification), err);
+        if (st == ATLAS_OK && it->test_suite[0] != '\0') st = atlas_json_key_str(ds->j, "test_suite", atlas_safe(&ds->safe, it->test_suite), err);
+        if (st == ATLAS_OK && it->test_target[0] != '\0') st = atlas_json_key_str(ds->j, "test_target", atlas_safe(&ds->safe, it->test_target), err);
+        if (st == ATLAS_OK && it->test_result[0] != '\0') st = atlas_json_key_str(ds->j, "test_result", atlas_safe(&ds->safe, it->test_result), err);
+        if (st == ATLAS_OK && it->test_commit[0] != '\0') st = atlas_json_key_str(ds->j, "test_commit", atlas_safe(&ds->safe, it->test_commit), err);
+        if (st == ATLAS_OK && it->test_evidence_uid[0] != '\0') st = atlas_json_key_str(ds->j, "test_evidence_uid", atlas_safe(&ds->safe, it->test_evidence_uid), err);
+        if (st == ATLAS_OK && it->test_evidence_uid[0] != '\0') st = atlas_json_key_bool(ds->j, "test_result_historical", true, err);
         if (st == ATLAS_OK) {
             st = atlas_json_obj_end(ds->j, err);
         }
@@ -954,6 +961,26 @@ static atlas_status method_sem_impact(dispatch_state *ds, const atlas_ipc_reques
 }
 
 
+static atlas_status context_seed_array(const atlas_ipc_request *req, const char *key,
+                                       atlas_buf *out, atlas_err *err) {
+    if (!atlas_ipc_param_present(req, key)) return ATLAS_OK;
+    const atlas_ipc_array *arr = NULL;
+    if (!atlas_ipc_param_array(req, key, &arr) ||
+        atlas_ipc_array_len(arr) > ATLAS_SEM_CONTEXT_MAX_SEEDS) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "context seeds must be bounded arrays of strings");
+    }
+    for (size_t i = 0; i < atlas_ipc_array_len(arr); i++) {
+        const char *value = NULL;
+        if (!atlas_ipc_array_str(arr, i, &value) || value[0] == '\0' ||
+            strlen(value) >= ATLAS_SEM_MAX_NAME_BYTES) {
+            return atlas_err_set(err, ATLAS_ERR_USAGE, "context seed is not a bounded nonempty string");
+        }
+        atlas_status st = atlas_buf_append(out, value, strlen(value) + 1, err);
+        if (st != ATLAS_OK) return st;
+    }
+    return ATLAS_OK;
+}
+
 static atlas_status method_sem_context(dispatch_state *ds, const atlas_ipc_request *req,
                                        atlas_err *err) {
     const char *task = NULL;
@@ -980,9 +1007,18 @@ static atlas_status method_sem_context(dispatch_state *ds, const atlas_ipc_reque
     (void)atlas_ipc_param_int(req, "max_items", &creq.max_items);
     (void)atlas_ipc_param_bool(req, "include_history", &creq.include_history);
 
+    atlas_buf paths = ATLAS_BUF_INIT, symbols = ATLAS_BUF_INIT;
+    st = context_seed_array(req, "paths", &paths, err);
+    if (st == ATLAS_OK) st = context_seed_array(req, "symbols", &symbols, err);
+    creq.paths = paths.data;
+    creq.paths_len = paths.len;
+    creq.symbols = symbols.data;
+    creq.symbols_len = symbols.len;
     atlas_sem_context_report rep;
     atlas_sem_context_report_init(&rep);
-    st = atlas_sem_context_on(ds->db, &info, &creq, &rep, err);
+    if (st == ATLAS_OK) st = atlas_sem_context_on(ds->db, &info, &creq, &rep, err);
+    atlas_buf_free(&paths);
+    atlas_buf_free(&symbols);
     atlas_repo_info_free(&info);
 
     if (st == ATLAS_OK) {
@@ -1024,6 +1060,7 @@ static atlas_status method_sem_context(dispatch_state *ds, const atlas_ipc_reque
     if (st == ATLAS_OK) {
         st = atlas_sem_trust_write_json(ds->j, &rep.trust, err);
     }
+    if (st == ATLAS_OK) st = atlas_sem_context_guidance_write_json(ds->j, &rep, err);
     atlas_sem_context_report_free(&rep);
     return st;
 }

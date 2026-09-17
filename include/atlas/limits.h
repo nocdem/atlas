@@ -780,11 +780,12 @@
 /* Default and maximum byte budget for one context package. The token budget a
  * caller gives is converted at ATLAS_SEM_BYTES_PER_TOKEN and then treated as
  * bytes, because bytes are what Atlas can actually count. */
-#define ATLAS_SEM_CONTEXT_DEFAULT_BYTES (32u * 1024u)
+#define ATLAS_SEM_CONTEXT_DEFAULT_BYTES (8u * 1024u)
 #define ATLAS_SEM_CONTEXT_MAX_BYTES (512u * 1024u)
 #define ATLAS_SEM_BYTES_PER_TOKEN 4
 /* Items one context package may hold, and terms one task description
  * contributes to ranking. */
+#define ATLAS_SEM_CONTEXT_DEFAULT_ITEMS 24
 #define ATLAS_SEM_CONTEXT_MAX_ITEMS 400
 #define ATLAS_SEM_CONTEXT_MAX_TERMS 64
 /* A9.1. How far the knowledge pass reaches: how many distinct anchor paths one
@@ -811,6 +812,12 @@
 #define ATLAS_SEM_CONTEXT_MAX_TASK_BYTES 8192u
 /* Starting paths and symbols one context request may name. */
 #define ATLAS_SEM_CONTEXT_MAX_SEEDS 64
+/* Diagnostic scope samples and fixed read suggestions are bounded separately
+ * from ranked items, so a small item budget cannot hide why results are partial. */
+#define ATLAS_SEM_CONTEXT_MAX_SCOPE 16u
+#define ATLAS_SEM_CONTEXT_MAX_GAPS 16u
+/* Historical test records inspected for one seed; omissions are disclosed. */
+#define ATLAS_SEM_CONTEXT_TEST_RECORDS 8u
 
 /* --- A9.2.3: the daemon's semantic freshness sweep --------------------------
  *

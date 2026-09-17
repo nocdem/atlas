@@ -388,6 +388,13 @@ static atlas_status fake_run(const atlas_driver_req *req, atlas_driver_res *res,
         atlas_buf log = ATLAS_BUF_INIT;
         atlas_status ls = atlas_buf_appendf(&log, err, "fake driver ran for job %s\n",
                                             req->job_uid != NULL ? req->job_uid : "");
+        /* A14R-F. A failing run echoes its task into the log, so a test can
+         * make the log as long as it likes and prove the tail the dispatcher
+         * carries is a tail -- bounded, and labelled truncated -- rather than
+         * the file. The successful path's log is unchanged. */
+        if (ls == ATLAS_OK && fail) {
+            ls = atlas_buf_appendf(&log, err, "task: %s\n", req->task != NULL ? req->task : "");
+        }
         if (ls == ATLAS_OK) {
             ls = store_log(req->ws, "logs/stdout.log", &log, &res->log, &res->redactions, err);
         }

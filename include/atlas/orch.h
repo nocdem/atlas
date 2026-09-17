@@ -441,6 +441,38 @@ bool atlas_orch_lease_in_grace(int64_t deadline_ms, int64_t at_ms, int64_t conte
  * one already is: name, size and digest, with `content_stored` false. */
 #define ATLAS_ORCH_RESULT_INLINE_TOTAL_MAX (320u * 1024u)
 
+/* --- A14R-F: the failure a steward can read ---------------------------------
+ *
+ * Two event kinds the dispatcher emits on a failed attempt, before its
+ * completion and under its own lease, through the `dispatch.event` write point
+ * every other event already uses. Nothing new is stored: an event payload is
+ * UNTRUSTED_DATA bounded at `ATLAS_ORCH_EVENT_MAX`, and both of these live
+ * inside that bound.
+ *
+ * `failure` carries what the dispatcher itself knew and the exit classification
+ * cannot say: the step that refused before a worker existed, the stop signal
+ * that cancelled one, or the failed gate's bounded output.
+ *
+ * `log_tail` carries the *tail* of one redacted stream the driver wrote into
+ * the attempt's workspace, behind a header the dispatcher composes. The header
+ * is Atlas' grammar — fixed keys, integers and yes/no — and ends at the first
+ * `--` line; everything after that line is bytes no branch anywhere reads. A
+ * reader can therefore tell "no log was written" (present=no) from "the
+ * dispatcher that carried this attempt predates the capability" (no such
+ * event at all), and "the whole log" from "the last N bytes of it"
+ * (truncated=yes with total_bytes). This is the bounded excerpt that A14R's
+ * "reachable under no name" is revised to permit; the transcript itself is
+ * still reachable from no remote route. */
+#define ATLAS_ORCH_EVENT_KIND_FAILURE "failure"
+#define ATLAS_ORCH_EVENT_KIND_LOG_TAIL "log_tail"
+#define ATLAS_ORCH_LOG_TAIL_MAGIC "atlas-log-tail-1"
+/* Bytes of one stream carried per event: the event ceiling less the header,
+ * with margin for the JSON escaping the transport applies. */
+#define ATLAS_ORCH_LOG_TAIL_MAX 6144u
+/* Events `job.remote_failure` returns beside the two above: the newest ones,
+ * so an attempt that emitted the maximum still answers inside one frame. */
+#define ATLAS_ORCH_FAILURE_EVENTS_MAX 16
+
 /* --- A11.1: the bound on one run -------------------------------------------
  *
  * How many times a worker may actually be *started* inside one run: the root

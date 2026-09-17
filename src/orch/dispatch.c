@@ -26,6 +26,8 @@
 #include "atlas/dispatch.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -407,7 +409,8 @@ static atlas_status validation_log(size_t index, const atlas_buf *redacted, void
     return ATLAS_OK;
 }
 
-static atlas_status run_validations(attempt *a, atlas_ws *ws, bool *passed, atlas_err *err) {
+static atlas_status run_validations(attempt *a, atlas_ws *ws, bool *passed,
+                                    atlas_buf *failure_out, atlas_err *err) {
     atlas_orch_argv cmds[ATLAS_ORCH_MAX_VALIDATIONS];
     for (size_t i = 0; i < ATLAS_ORCH_MAX_VALIDATIONS; i++) {
         atlas_orch_argv_init(&cmds[i]);
@@ -479,6 +482,31 @@ static atlas_status run_validations(attempt *a, atlas_ws *ws, bool *passed, atla
     *passed = st == ATLAS_OK && gr.passed;
     if (st == ATLAS_OK && !gr.passed && gr.failed_index >= 0) {
         emit_event(a, "validation", "a declared validation command did not pass");
+        /* A14R-F. Which gate, and what it printed — the bounded, redacted
+         * output `atlas_validations_run` already captured and this dispatcher
+         * used to discard. The run driver has always carried the same excerpt
+         * as a completion's `detail`; here it becomes the `failure` event so
+         * a remote reader can see it. UNTRUSTED_DATA, quoted and never read. */
+        atlas_err ignore;
+        atlas_err_init(&ignore);
+        if (failure_out != NULL &&
+            atlas_buf_appendf(failure_out, &ignore, "gate %lld failed:",
+                              (long long)gr.failed_index) == ATLAS_OK) {
+            size_t gi = (size_t)gr.failed_index;
+            for (size_t k = 0; gi < n && k < cmds[gi].count; k++) {
+                (void)atlas_buf_appendf(failure_out, &ignore, " %s",
+                                        atlas_buf_cstr(&cmds[gi].args[k]));
+            }
+            size_t take = gr.output.len < ATLAS_ORCH_GATE_EXCERPT_MAX
+                              ? gr.output.len
+                              : ATLAS_ORCH_GATE_EXCERPT_MAX;
+            (void)atlas_buf_append_str(failure_out, "\noutput (bounded excerpt, untrusted):\n",
+                                       &ignore);
+            (void)atlas_buf_append(failure_out, gr.output.data, take, &ignore);
+            if (take < gr.output.len) {
+                (void)atlas_buf_append_str(failure_out, "\n(truncated)\n", &ignore);
+            }
+        }
     }
     atlas_validation_result_free(&gr);
     for (size_t i = 0; i < ATLAS_ORCH_MAX_VALIDATIONS; i++) {
@@ -487,6 +515,146 @@ static atlas_status run_validations(attempt *a, atlas_ws *ws, bool *passed, atla
     return st;
 }
 
+
+/* --- A14R-F: what a failed attempt leaves in the ledger ------------------------
+ *
+ * Two event kinds, sent under the attempt's own lease before its completion,
+ * through the `dispatch.event` write point every other event uses. Nothing new
+ * is stored anywhere: an event payload is already UNTRUSTED_DATA bounded at
+ * `ATLAS_ORCH_EVENT_MAX`.
+ *
+ * `failure` carries what this dispatcher knew and the exit classification
+ * cannot say — the step that refused before a worker existed (a snapshot the
+ * daemon would not open, a workspace that would not create), the stop signal
+ * that cancelled a running worker, or the gate that failed and what it printed.
+ * A plain non-zero exit sends none: the attempt row already says that.
+ *
+ * `log_tail` carries the last `ATLAS_ORCH_LOG_TAIL_MAX` bytes of one stream the
+ * driver wrote into the workspace, behind a header this dispatcher composes.
+ * The bytes are read back from the file the driver stored **redacted** — never
+ * from the capture buffer — so what travels is exactly what an operator would
+ * find in `logs/`. One event per stream, sent even when the file does not
+ * exist, so a reader can tell "no log" from "no dispatcher carried one".
+ *
+ * Every send here is best-effort, as every event is: the completion that
+ * follows is the outcome, and losing a line of narrative is not worth losing
+ * that. Under a stop signal the process is on its way out, so the count of
+ * sends is fixed at three. */
+
+/* Reads the tail of one workspace file. `present` is false when the file does
+ * not exist or is not a regular file; nothing is followed and nothing outside
+ * the attempt root is opened. NUL bytes are replaced and counted, because the
+ * payload travels as a JSON string and a string ends at the first NUL. */
+static void read_tail(const atlas_ws *ws, const char *rel, atlas_buf *out, bool *present,
+                      int64_t *total, bool *truncated, int64_t *nul_replaced) {
+    *present = false;
+    *total = 0;
+    *truncated = false;
+    *nul_replaced = 0;
+    atlas_buf_reset(out);
+    if (ws == NULL || ws->root_fd < 0) {
+        return;
+    }
+    int fd = openat(ws->root_fd, rel, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NOCTTY);
+    if (fd < 0) {
+        return;
+    }
+    struct stat sb;
+    if (fstat(fd, &sb) != 0 || !S_ISREG(sb.st_mode)) {
+        (void)close(fd);
+        return;
+    }
+    *present = true;
+    *total = (int64_t)sb.st_size;
+    off_t off = 0;
+    size_t want = (size_t)sb.st_size;
+    if (sb.st_size > (off_t)ATLAS_ORCH_LOG_TAIL_MAX) {
+        off = sb.st_size - (off_t)ATLAS_ORCH_LOG_TAIL_MAX;
+        want = ATLAS_ORCH_LOG_TAIL_MAX;
+        *truncated = true;
+    }
+    char chunk[4096];
+    atlas_err ignore;
+    atlas_err_init(&ignore);
+    while (want > 0) {
+        size_t n = want < sizeof chunk ? want : sizeof chunk;
+        ssize_t got = pread(fd, chunk, n, off);
+        if (got <= 0) {
+            break;
+        }
+        for (ssize_t i = 0; i < got; i++) {
+            if (chunk[i] == '\0') {
+                chunk[i] = '?';
+                (*nul_replaced)++;
+            }
+        }
+        if (atlas_buf_append(out, chunk, (size_t)got, &ignore) != ATLAS_OK) {
+            break;
+        }
+        off += got;
+        want -= (size_t)got;
+    }
+    (void)close(fd);
+}
+
+static void emit_log_tail(attempt *a, const atlas_ws *ws, const char *stream) {
+    char rel[32];
+    (void)snprintf(rel, sizeof rel, "logs/%s.log", stream);
+    atlas_buf bytes = ATLAS_BUF_INIT;
+    bool present = false, truncated = false;
+    int64_t total = 0, nuls = 0;
+    read_tail(ws, rel, &bytes, &present, &total, &truncated, &nuls);
+    atlas_buf payload = ATLAS_BUF_INIT;
+    atlas_err ignore;
+    atlas_err_init(&ignore);
+    atlas_status st = atlas_buf_appendf(
+        &payload, &ignore,
+        ATLAS_ORCH_LOG_TAIL_MAGIC "\nstream=%s\npresent=%s\ntotal_bytes=%lld\ntail_bytes=%zu\n"
+        "truncated=%s\nnul_replaced=%lld\n--\n",
+        stream, present ? "yes" : "no", (long long)total, bytes.len, truncated ? "yes" : "no",
+        (long long)nuls);
+    if (st == ATLAS_OK) {
+        st = atlas_buf_append(&payload, bytes.data, bytes.len, &ignore);
+    }
+    if (st == ATLAS_OK) {
+        emit_event(a, ATLAS_ORCH_EVENT_KIND_LOG_TAIL, atlas_buf_cstr(&payload));
+    }
+    atlas_buf_free(&payload);
+    atlas_buf_free(&bytes);
+}
+
+/* `st`/`err` are the attempt's own status at the point the driver would have
+ * run or did run; `driver_ran` says which. `gate_failure` is what
+ * `run_validations` composed, empty when no gate failed. */
+static void report_failure(attempt *a, const atlas_ws *ws, atlas_status st, const atlas_err *err,
+                           bool driver_ran, const atlas_buf *gate_failure) {
+    atlas_buf msg = ATLAS_BUF_INIT;
+    atlas_err ignore;
+    atlas_err_init(&ignore);
+    bool have = false;
+    if (st != ATLAS_OK) {
+        /* Atlas' own error text, from the step that refused. */
+        have = atlas_buf_appendf(&msg, &ignore, "%s: %s",
+                                 driver_ran ? "the driver returned an error"
+                                            : "the attempt failed before the worker started",
+                                 atlas_err_msg(err)) == ATLAS_OK;
+    } else if (g_stop != 0) {
+        have = atlas_buf_append_str(
+                   &msg,
+                   "the dispatcher received a stop signal while this attempt was running and "
+                   "cancelled the worker; this is a dispatcher restart or shutdown, not a "
+                   "worker error",
+                   &ignore) == ATLAS_OK;
+    } else if (gate_failure != NULL && gate_failure->len > 0) {
+        have = atlas_buf_append(&msg, gate_failure->data, gate_failure->len, &ignore) == ATLAS_OK;
+    }
+    if (have) {
+        emit_event(a, ATLAS_ORCH_EVENT_KIND_FAILURE, atlas_buf_cstr(&msg));
+    }
+    atlas_buf_free(&msg);
+    emit_log_tail(a, ws, "stdout");
+    emit_log_tail(a, ws, "stderr");
+}
 /* --- receiving the snapshot ---------------------------------------------------
  *
  * The worker asks; the daemon reads. Nothing here names a repository, a commit
@@ -968,6 +1136,7 @@ static atlas_status run_attempt(attempt *a, atlas_err *err) {
     }
 
     const atlas_driver *drv = NULL;
+    bool drv_ran = false;
     if (st == ATLAS_OK) {
         drv = atlas_driver_find(atlas_buf_cstr(&a->driver));
         if (drv == NULL) {
@@ -1007,6 +1176,7 @@ static atlas_status run_attempt(attempt *a, atlas_err *err) {
          * paths cannot disagree about which model a role runs under. */
         req.model = atlas_driver_model_for(drv, &o->models);
         req.max_cost_cents = o->max_cost_cents;
+        drv_ran = true;
         st = drv->run(&req, &dr, err);
     }
     atlas_buf_free(&composed);
@@ -1025,11 +1195,12 @@ static atlas_status run_attempt(attempt *a, atlas_err *err) {
     }
 
     bool validated = true;
+    atlas_buf gate_failure = ATLAS_BUF_INIT;
     if (st == ATLAS_OK && dr.exit_kind == ATLAS_ORCH_EXIT_OK && a->validations.len > 0) {
         atlas_err verr;
         atlas_err_init(&verr);
         if (heartbeat(a, "VALIDATING", &verr) == ATLAS_OK) {
-            (void)run_validations(a, &ws, &validated, &verr);
+            (void)run_validations(a, &ws, &validated, &gate_failure, &verr);
         }
     }
 
@@ -1045,6 +1216,17 @@ static atlas_status run_attempt(attempt *a, atlas_err *err) {
     }
 
     success = (st == ATLAS_OK) && dr.exit_kind == ATLAS_ORCH_EXIT_OK && validated && !a->cancelled;
+
+    /* A14R-F. Before the completion, under the lease that is about to be
+     * released: the dispatcher's own account of the failure and the tails of
+     * the streams the driver stored. Only for an attempt that did not succeed
+     * -- a successful attempt's answer is `result.txt`, and its workspace is
+     * removed below. `st` and `err` are still the attempt's own at this point;
+     * nothing between the driver and here overwrote them. */
+    if (!success) {
+        report_failure(a, &ws, st, err, drv_ran, &gate_failure);
+    }
+    atlas_buf_free(&gate_failure);
 
     /* Reported even when something above failed: an attempt the daemon never
      * hears about is one it has to expire, and an expiry says less than a

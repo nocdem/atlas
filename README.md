@@ -3,13 +3,15 @@
 > Evidence-backed engineering memory and repository intelligence for
 > AI-assisted software development.
 
-Atlas is a local, headless C17 application that indexes Git repositories into a
-rebuildable SQLite database. It gives developers and AI tools a shared view of
+Atlas is a local, headless C17 application that stores rebuildable Git indexes
+and durable engineering records in SQLite. It gives developers and AI tools a shared view of
 code, history, decisions, evidence, coverage and staleness through a CLI, local
 daemon, MCP server and authenticated HTTP gateway.
 
-Atlas is experimental software at **v0.1.0 / phase A12.0**. It currently targets
-Linux. It does not apply patches, commit, push or perform GitHub actions.
+Atlas is experimental software at **v0.1.0 / phase A17**, targeting Linux.
+Indexing is read-only. Separately configured workers can edit workspaces, and
+an optional external deploy agent can apply a stored patch after confirmation
+by a credential distinct from the submitter's. See [remote deploy](docs/remote-deploy.md).
 
 ## Why Atlas exists
 
@@ -49,9 +51,12 @@ control layer beside them.
   workspaces, operator-supplied gates, bounded parallel tasks and multi-stage
   planned runs. A worker result is an artifact, not authority.
 - **Remote read access and remote submission:** scoped credentials, remote MCP,
-  a read-only web API, Mission Control (which can now also dispose of a record),
-  and A14's remote submission — a bearer credential the policy names queues a job
-  the daemon verifies and the policy bounds.
+  read APIs and Mission Control, with separate policy-controlled routes for
+  knowledge-record decisions, job submission and deployment confirmation.
+  The daemon verifies credentials and enforces submission bounds.
+- **Confirmed deployment:** an external, operator-installed agent applies
+  Atlas's stored patch, builds, tests, installs and restarts under a root-owned
+  configuration. The request cannot choose the commands or target directory.
 - **Local operations:** verified online backups, atomic restore and explicit
   retention policy. These operations are not exposed to a model or remote API.
 
@@ -77,10 +82,15 @@ index; add the service, semantic index or MCP integration only when needed.
 
 ## Trust boundary and evidence
 
-**Atlas never modifies a repository it indexes.** Git commands pass a read-only
+**Atlas's indexing and query paths never modify a repository.** Git commands pass a read-only
 allowlist, executable hooks and external diff drivers are disabled, paths are
 opened without following symlinks, and tests compare the entire repository tree
 including `.git` before and after Atlas commands.
+
+Worker editing and confirmed deployment have separate authority contracts;
+enabling repository indexing alone enables neither. The database also contains
+decision revisions, lifecycle events, attribution and evidence that rescanning
+cannot recover. Preserve them with [verified backups](docs/operations.md).
 
 The repository includes its threat model, known limitations, security reviews,
 full test suite and the reports from bounded live pilots. These are engineering
@@ -118,6 +128,11 @@ Linux only: the watcher is inotify, and peer identity on the socket is
 `SO_PEERCRED`.
 
 ## Build, test, install
+
+The [CI workflow](.github/workflows/ci.yml) defines Release regressions and smoke
+checks, ASan/UBSan, TSan and a build without libclang. See
+[frontend modules](docs/frontend-modules.md) for the check subsets and
+[context measurements](docs/context-benchmark.md) for the reproducible benchmark.
 
 ```sh
 make            # release build -> build/atlas

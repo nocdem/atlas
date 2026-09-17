@@ -2615,6 +2615,20 @@ static atlas_status h_sem_indexed(atlas_renderer *r, const atlas_sem_index_summa
  * saying what selected it and how strongly. They print the same way, with the
  * evidence class always beside the item — a reader must never have to guess
  * whether a line was proven or inferred from a filename. */
+static void h_test_metadata(atlas_renderer *r, const atlas_sem_item *it) {
+    if (it->test_classification[0] != '\0') {
+        (void)fprintf(r->out, "                     test classification: %s\n",
+                      atlas_safe(&r->safe, it->test_classification));
+    }
+    if (it->test_target[0] != '\0') {
+        (void)fprintf(r->out, "                     recorded target: %s / %s\n",
+                      atlas_safe(&r->safe, it->test_suite), atlas_safe(&r->safe, it->test_target));
+        (void)fprintf(r->out, "                     historical result: %s at %s (evidence %s)\n",
+                      atlas_safe(&r->safe, it->test_result), atlas_safe(&r->safe, it->test_commit),
+                      atlas_safe(&r->safe, it->test_evidence_uid));
+    }
+}
+
 static atlas_status h_sem_impact(atlas_renderer *r, const atlas_sem_impact_report *rep,
                                  atlas_err *err) {
     (void)err;
@@ -2629,7 +2643,6 @@ static atlas_status h_sem_impact(atlas_renderer *r, const atlas_sem_impact_repor
                   rep->subject_is_path ? "file" : "symbol");
     if (!rep->subject_found) {
         (void)fprintf(o, "the semantic index holds nothing by that name\n");
-        return ATLAS_OK;
     }
 
     for (size_t i = 0; i < rep->count; i++) {
@@ -2641,6 +2654,7 @@ static atlas_status h_sem_impact(atlas_renderer *r, const atlas_sem_impact_repor
                           (long long)it->line);
         }
         (void)fprintf(o, "                     %s\n", it->why != NULL ? it->why : "");
+        h_test_metadata(r, it);
     }
 
     /* Split, never summed: a total would hide the one distinction that
@@ -2704,6 +2718,7 @@ static atlas_status h_sem_context(atlas_renderer *r, const atlas_sem_context_rep
             }
         }
         (void)fprintf(o, "\n                     %s\n", it->why != NULL ? it->why : "");
+        h_test_metadata(r, it);
     }
 
     /* What the package could not supply. Printed last and always, so it reads
@@ -2717,6 +2732,16 @@ static atlas_status h_sem_context(atlas_renderer *r, const atlas_sem_context_rep
         }
     }
     h_sem_verdict(r, &rep->trust);
+    for (size_t i = 0; i < rep->scope_count; i++) {
+        const atlas_sem_context_scope *f = &rep->scope[i];
+        (void)fprintf(o, "scope %s: file index %s, %lld/%lld complete translation units\n",
+                      atlas_safe(&r->safe, f->path), f->in_file_index ? "present" : "not found",
+                      (long long)f->complete_units, (long long)f->units);
+    }
+    if (rep->scope_truncated) (void)fprintf(o, "scope: additional files omitted\n");
+    for (size_t i = 0; i < rep->next_step_count; i++) {
+        (void)fprintf(o, "next: %s\n", rep->next_steps[i]);
+    }
     return ATLAS_OK;
 }
 

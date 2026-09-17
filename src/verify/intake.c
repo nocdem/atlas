@@ -539,6 +539,14 @@ static atlas_status op_claim_create(atlas_db *db, const atlas_verify_op *op, con
     if (st == ATLAS_OK) {
         st = bounded(&op->text, ATLAS_VERIFY_CLAIM_TEXT_MAX, "a claim's proposition", err);
     }
+    if (st == ATLAS_OK && op->text.len > 0 &&
+        memchr(op->text.data, '\0', op->text.len) != NULL) {
+        /* The content key hashes every byte, while the text column's C-string
+         * binding stops at NUL. Refuse before either representation is stored. */
+        st = atlas_err_set(err, ATLAS_ERR_USAGE,
+                           "a claim's proposition contains an embedded NUL; "
+                           "it is refused rather than shortened");
+    }
     if (st == ATLAS_OK) {
         st = bounded(&op->scope_note, ATLAS_VERIFY_SCOPE_MAX, "a claim's scope note", err);
     }

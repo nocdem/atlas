@@ -220,6 +220,30 @@ static atlas_status detail_of(atlas_db *db, const char *run_uid, atlas_buf *out,
     return st;
 }
 
+static atlas_status patch_paths_of(atlas_db *db, atlas_orch_memory_cand *c, atlas_err *err) {
+    static const char SQL[] =
+        "SELECT a.content, a.size_bytes FROM orch_artifacts a"
+        " JOIN orch_jobs j ON j.id = a.job_id"
+        " WHERE j.run_uid = ?1 AND a.name = 'changes.patch' AND a.content_stored = 1"
+        " ORDER BY a.id DESC LIMIT 1;";
+    sqlite3_stmt *q = NULL;
+    atlas_status st = atlas_db_prepare(db, SQL, &q, err);
+    if (st == ATLAS_OK) st = atlas_db_bind_text_opt(db, q, 1, c->run_uid, err);
+    int rc = SQLITE_DONE;
+    if (st == ATLAS_OK && (rc = sqlite3_step(q)) == SQLITE_ROW) {
+        const void *data = sqlite3_column_blob(q, 0);
+        int n = sqlite3_column_bytes(q, 0);
+        st = atlas_orch_memory_patch_paths(data, n > 0 ? (size_t)n : 0, &c->files,
+                                           &c->files_incomplete, err);
+        if ((int64_t)n != sqlite3_column_int64(q, 1)) c->files_incomplete = true;
+    }
+    if (st == ATLAS_OK && rc != SQLITE_DONE && rc != SQLITE_ROW) {
+        st = atlas_db_fail(db, err, ATLAS_ERR_DB, "cannot read stored patch paths");
+    }
+    if (q != NULL) atlas_db_finish(db, q);
+    return st;
+}
+
 /* Gathers at most ATLAS_ORCH_MEMORY_MAX_CANDIDATES terminal runs sharing the
  * requesting repository's lineage, newest first.
  *
@@ -376,6 +400,7 @@ static atlas_status enrich(atlas_db *db, atlas_orch_memory_cand *c, const char *
     if (st == ATLAS_OK) {
         st = detail_of(db, c->run_uid, &c->detail, err);
     }
+    if (st == ATLAS_OK) st = patch_paths_of(db, c, err);
     if (st == ATLAS_OK) {
         atlas_status us = atlas_db_orch_run_usage(db, c->run_uid, &c->usage, err);
         if (us == ATLAS_OK) {

@@ -211,6 +211,7 @@ static void test_a_schema_nine_database_reaches_ten_additively(void) {
               * goes first -- SQLite refuses to drop a column an index names. */
              "DROP INDEX idx_orch_jobs_submit_key;"
              "ALTER TABLE orch_jobs DROP COLUMN submit_key_id;"
+             "ALTER TABLE orch_jobs DROP COLUMN model;"
              "ALTER TABLE orch_transitions DROP COLUMN key_id;"
              /* A17 T1's two tables, children before parents: a
               * rewind that leaves a later migration's table behind is not a

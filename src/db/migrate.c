@@ -4926,6 +4926,11 @@ static const char M33_DEPLOY_TRANSITIONS[] =
 
 static const char *const M33_STATEMENTS[] = {M33_DEPLOYS, M33_DEPLOY_TRANSITIONS, NULL};
 
+static const char *const M34_STATEMENTS[] = {
+    "ALTER TABLE orch_jobs ADD COLUMN model TEXT NOT NULL DEFAULT '';",
+    NULL,
+};
+
 static const atlas_migration MIGRATIONS[] = {
     {1, "initial schema", M1_STATEMENTS, false},
     {2, "worktree identity", M2_STATEMENTS, false},
@@ -5062,6 +5067,7 @@ static const atlas_migration MIGRATIONS[] = {
     {33, "a deploy a credential proposed, a different credential confirmed, and a root agent "
          "reported",
      M33_STATEMENTS, false},
+    {34, "the model pinned when a remote job is submitted", M34_STATEMENTS, false},
 };
 
 const atlas_migration *atlas_migrations(size_t *count_out) {

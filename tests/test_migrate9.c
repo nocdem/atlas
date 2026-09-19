@@ -60,7 +60,7 @@ static void test_a_fresh_database_is_schema_nine_with_relates_to(void) {
     T_EQ_INT(schema_of(db), ATLAS_SCHEMA_VERSION);
     /* Migrations 31 (A16's T2), 32 (A14's T2) and 33 (A17 T1) landed
      * after this suite was written. */
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 33);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 34);
 
     /* Native, not merely tolerated. Asked of the stored schema rather than by
      * inserting a row: the CHECK is what the vocabulary *is*, and a test that

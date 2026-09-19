@@ -75,6 +75,7 @@ to a mode of `a|b` with an empty driver.
 | `repo_identity_hash` | yes | the durable identity; a path is chosen by whoever made the directory |
 | `source_commit` | yes | exact and pinned; the tree the job was authorised over |
 | `mode`, `driver` | yes | what will run, and how |
+| `model` | yes | optional pinned selection; spec version/domain v2 prevents different models sharing an idempotency identity |
 | `task_text` | yes | the request itself |
 | `allowed_paths` | yes | a **set**: sorted and deduplicated, so order does not change identity |
 | `validations` | yes | a **list**: order is part of what was asked for |

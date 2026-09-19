@@ -159,6 +159,7 @@ typedef struct attempt {
     atlas_buf commit;
     atlas_buf mode;
     atlas_buf driver;
+    atlas_buf model;
     atlas_buf task;
     atlas_buf allowed_paths;
     atlas_buf validations;
@@ -195,6 +196,7 @@ static void attempt_init(attempt *a) {
     atlas_buf_init(&a->commit);
     atlas_buf_init(&a->mode);
     atlas_buf_init(&a->driver);
+    atlas_buf_init(&a->model);
     atlas_buf_init(&a->task);
     atlas_buf_init(&a->allowed_paths);
     atlas_buf_init(&a->validations);
@@ -215,6 +217,7 @@ static void attempt_free(attempt *a) {
     atlas_buf_free(&a->commit);
     atlas_buf_free(&a->mode);
     atlas_buf_free(&a->driver);
+    atlas_buf_free(&a->model);
     atlas_buf_free(&a->task);
     atlas_buf_free(&a->allowed_paths);
     atlas_buf_free(&a->validations);
@@ -1174,7 +1177,8 @@ static atlas_status run_attempt(attempt *a, atlas_err *err) {
         req.operator_session = o->operator_session;
         /* A12.0. The same helper the foreground run driver uses, so the two
          * paths cannot disagree about which model a role runs under. */
-        req.model = atlas_driver_model_for(drv, &o->models);
+        req.model = a->model.len > 0 ? atlas_buf_cstr(&a->model)
+                                     : atlas_driver_model_for(drv, &o->models);
         req.max_cost_cents = o->max_cost_cents;
         drv_ran = true;
         st = drv->run(&req, &dr, err);
@@ -1280,7 +1284,7 @@ static atlas_status take_grant(const rpc *r, attempt *a, atlas_err *err) {
     } strs[] = {
         {&a->job_uid, "job"},        {&a->token, "token"},
         {&a->repo_root, "repo_root"}, {&a->commit, "commit"},
-        {&a->mode, "mode"},          {&a->driver, "driver"},
+        {&a->mode, "mode"},          {&a->driver, "driver"}, {&a->model, "model"},
         {&a->task, "task"},          {&a->allowed_paths, "allowed_paths"},
         {&a->validations, "validations"},
         /* A12.1 T13. This dispatcher's workspace attempt path never read

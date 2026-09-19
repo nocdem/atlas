@@ -579,7 +579,7 @@ static atlas_status j_job_item(atlas_renderer *r, const atlas_job_render *jr, at
         const char *v;
     } strs[] = {
         {"job", jr->job},         {"state", jr->state},
-        {"repo", jr->repo},       {"driver", jr->driver},
+        {"repo", jr->repo},       {"driver", jr->driver}, {"model", jr->model},
         {"created_at", jr->created_at},
     };
     for (size_t i = 0; st == ATLAS_OK && i < sizeof strs / sizeof strs[0]; i++) {

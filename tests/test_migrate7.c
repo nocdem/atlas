@@ -292,7 +292,7 @@ static void test_a_populated_schema_six_database_reaches_seven_losslessly(void) 
      * 32 appended columns to `orch_jobs`/`orch_transitions`, and migration 33
      * added two new tables; the explicit column list below is what keeps this
      * comparison about seven's columns only. */
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 33);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 34);
 
     atlas_buf after = ATLAS_BUF_INIT;
     text_of(db,

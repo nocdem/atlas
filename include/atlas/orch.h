@@ -50,7 +50,7 @@
 
 /* The job-specification schema version. Bumped when the canonical encoding
  * changes shape, which changes every digest — see ATLAS_ORCH_SPEC_DOMAIN. */
-#define ATLAS_ORCH_SPEC_VERSION 1
+#define ATLAS_ORCH_SPEC_VERSION 2
 
 /* Domain separation for the canonical job-specification digest, following A4's
  * rule exactly: domain-separated and length-prefixed, never delimited. With any
@@ -59,7 +59,7 @@
  *
  * Bump this whenever the encoding changes. Every stored `spec_digest` means
  * something different afterwards, which is the point of it being in the string. */
-#define ATLAS_ORCH_SPEC_DOMAIN "atlas.orch.spec.v1"
+#define ATLAS_ORCH_SPEC_DOMAIN "atlas.orch.spec.v2"
 
 /* The lease token is a bearer secret. Only its digest is stored, and this domain
  * separates that digest from every other SHA-256 in Atlas so a value from one
@@ -556,6 +556,7 @@ typedef struct atlas_orch_spec {
 
     atlas_buf mode;   /* from the policy's vocabulary */
     atlas_buf driver; /* from the policy's vocabulary */
+    atlas_buf model;  /* pinned remote selection; empty uses the role default */
 
     /* UNTRUSTED_DATA. Stored, hashed, labelled at every boundary, and never
      * placed in automatic model context. */

@@ -3807,6 +3807,12 @@ grants the capability through the policy, not through the peer uid. Calling
 `require_submitter` there would be a check against the gateway uid — always
 true and therefore meaningless.
 
+**Model selection extension.** A remote request may select a model from explicit
+`remote_submit_model = driver:model` policy entries. The policy still determines
+the allowed driver/model pairs; the caller cannot supply an arbitrary driver.
+The chosen pair is persisted and execution uses that pair. Mode, gates and
+bounds remain fixed by policy.
+
 **Why the policy — not the request — decides the driver, mode, gate floor and
 bounds.** A request that could name its own driver or lift its own gate floor
 would be a request that could choose its own verification. The policy is

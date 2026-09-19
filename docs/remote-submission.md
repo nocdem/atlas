@@ -569,3 +569,56 @@ from the external model over `/mcp` in this pass; both were made with the same
 credentials from this host, which tests the routes and the write point and
 says nothing about the two clients. The Jobs view was not opened. Those
 remain to be observed.
+
+
+## Selecting a model when submitting a job
+
+`atlas_job_submit` and `POST /api/v1/job/submit` accept an optional `model`.
+The name must match a root-owned gateway-policy choice exactly:
+
+```ini
+remote_submit_model = codex:gpt-6-astra
+remote_submit_model = claude:sonnet
+```
+
+These optional, repeatable lines augment the existing complete submission block.
+At most 16 choices are accepted. Each is `driver:model`, with 1–64 lowercase
+ASCII letters, digits, dots, underscores or hyphens in each name. Duplicate
+model names, unknown drivers and malformed lines disable the policy. Only the
+isolated executor drivers `codex` and `claude` are selectable here. Both must
+also be enabled in orchestration policy, with `live_model = on`; listing a
+choice does not enable execution by itself. `atlas gateway status` reports the
+choices, annotated as checked at submit.
+
+For example:
+
+```json
+{"repo":"atlas","task":"Implement the requested change","model":"gpt-6-astra","key":"astra-job-1"}
+```
+
+A second job can use `"model":"sonnet"`. Omitting `model` preserves the
+configured `remote_submit_driver` and dispatcher role default. Unknown, empty
+or non-string selections are refused. Callers still cannot set drivers, modes,
+gates, credentials or budgets. Authentication, ownership and queue quotas stay
+at the existing write point.
+
+The selected model and driver are stored with the job, included in its spec
+identity, returned in submission/status/list data, and carried in the lease to
+the executor's `--model` argument. The `model` field is the requested selection;
+an empty value means no model was pinned, not that execution used no model.
+Provider-reported usage remains separate evidence of what ran. Changing a
+selection while reusing an idempotency key is refused.
+
+Migration 34 adds an empty-default `orch_jobs.model` without rewriting old jobs.
+Specification version and digest domain advance to v2: pre-upgrade idempotency
+keys cannot be replayed as new v2 specifications. Existing jobs retain their
+recorded digest and default-model behavior. Deploy daemon and dispatcher together;
+an old dispatcher does not understand the new lease field.
+
+Codex selections are refused when `max_cost_usd` is positive because Atlas's
+Codex driver cannot enforce that dollar cap. This feature does not lower that
+budget or change credentials. Activation requires installing the updated
+binaries, configuring the model choices and permitted drivers, an appropriate
+operator-session dispatcher and trusted executable path, and verified provider
+access to the named model. The implementation's fixture tests do not establish
+live Astra access.

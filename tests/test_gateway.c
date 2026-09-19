@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "atlas/decision.h"
+#include "atlas/orch_remote.h"
 #include "atlas/gateway.h"
 #include "atlas/gwpolicy.h"
 #include "atlas/http.h"
@@ -1760,7 +1761,73 @@ static void test_mission_control_serves_the_deploy_panel_bytes(void) {
     atlas_buf_free(&resp);
 }
 
+
+static void test_remote_model_choices(void) {
+    static const char BASE[] =
+        "enabled = yes\ngateway_uid = 1001\nremote_mcp = yes\ntls_mode = REVERSE_PROXY\n"
+        "remote_submit_key = key_b2578f48143c06d3\n"
+        "remote_submit_driver = claude\nremote_submit_mode = patch\n"
+        "remote_submit_gate = make\nremote_submit_max_attempts = 1\n"
+        "remote_submit_max_active = 2\nremote_submit_max_per_day = 6\n";
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_buf config = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_appendf(&config, &err, "%sremote_submit_model = codex:gpt-6-astra\n"
+                           "remote_submit_model = claude:sonnet\n", BASE), &err);
+    atlas_gwpolicy gw;
+    parse_policy(atlas_buf_cstr(&config), &gw);
+    T_REQUIRE(gw.state == ATLAS_GWPOLICY_ENABLED);
+    T_EQ_INT(gw.remote_submit_model_count, 2);
+    atlas_orchpolicy orch;
+    memset(&orch, 0, sizeof(orch));
+    orch.state = ATLAS_ORCHPOLICY_ENABLED;
+    orch.live_model = true;
+    orch.driver_count = 2;
+    (void)snprintf(orch.drivers[0], sizeof orch.drivers[0], "claude");
+    (void)snprintf(orch.drivers[1], sizeof orch.drivers[1], "codex");
+    const char *driver, *model;
+    T_OK(atlas_orch_remote_select_model(&gw, &orch, "gpt-6-astra", &driver, &model, &err), &err);
+    T_CHECK(strcmp(driver, "codex") == 0 && strcmp(model, "gpt-6-astra") == 0);
+    T_OK(atlas_orch_remote_select_model(&gw, &orch, "sonnet", &driver, &model, &err), &err);
+    T_CHECK(strcmp(driver, "claude") == 0 && strcmp(model, "sonnet") == 0);
+    T_OK(atlas_orch_remote_select_model(&gw, &orch, NULL, &driver, &model, &err), &err);
+    T_CHECK(strcmp(driver, "claude") == 0 && model[0] == '\0');
+    T_FAILS_WITH(atlas_orch_remote_select_model(&gw, &orch, "unknown", &driver, &model, &err),
+                 ATLAS_ERR_USAGE, &err);
+    orch.max_cost_cents = 100;
+    T_FAILS_WITH(atlas_orch_remote_select_model(&gw, &orch, "gpt-6-astra", &driver, &model, &err),
+                 ATLAS_ERR_INTEGRITY, &err);
+    T_OK(atlas_orch_remote_select_model(&gw, &orch, "sonnet", &driver, &model, &err), &err);
+    orch.max_cost_cents = 0;
+    orch.live_model = false;
+    T_FAILS_WITH(atlas_orch_remote_select_model(&gw, &orch, "sonnet", &driver, &model, &err),
+                 ATLAS_ERR_INTEGRITY, &err);
+    orch.live_model = true;
+    orch.driver_count = 1;
+    T_FAILS_WITH(atlas_orch_remote_select_model(&gw, &orch, "gpt-6-astra", &driver, &model, &err),
+                 ATLAS_ERR_INTEGRITY, &err);
+    static const char *const BAD[] = {
+        "codex", "codex:", ":sonnet", "fake:sonnet", "claude-repo:sonnet",
+        "codex:bad model", "codex:bad:model", "codex:gpt\nremote_submit_model = claude:gpt"
+    };
+    for (size_t i = 0; i < sizeof BAD / sizeof BAD[0]; i++) {
+        atlas_buf_reset(&config);
+        T_OK(atlas_buf_appendf(&config, &err, "%sremote_submit_model = %s\n", BASE, BAD[i]), &err);
+        parse_policy(atlas_buf_cstr(&config), &gw);
+        T_CHECK(gw.reason == ATLAS_GWPOLICY_REASON_MALFORMED);
+    }
+    atlas_buf_reset(&config);
+    T_OK(atlas_buf_set_str(&config, BASE, &err), &err);
+    for (int i = 0; i < 17; i++) {
+        T_OK(atlas_buf_appendf(&config, &err, "remote_submit_model = codex:model%d\n", i), &err);
+    }
+    parse_policy(atlas_buf_cstr(&config), &gw);
+    T_CHECK(gw.reason == ATLAS_GWPOLICY_REASON_MALFORMED);
+    atlas_buf_free(&config);
+}
+
 static const atlas_test TESTS[] = {
+    {"remote model choices are bounded and policy controlled", test_remote_model_choices},
     {"a complete policy enables the gateway", test_a_complete_policy_enables_the_gateway},
     {"a zeroed policy authorises nothing", test_a_zeroed_policy_authorises_nothing},
     {"every malformed policy disables the gateway",

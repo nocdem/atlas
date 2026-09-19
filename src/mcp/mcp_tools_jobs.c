@@ -20,6 +20,7 @@
 
 typedef struct job_args {
     const char *repo;
+    const char *model;
     const char *task;  /* atlas_job_submit */
     const char *key;   /* atlas_job_submit: idempotency key */
     const char *job;   /* atlas_job_status, atlas_job_cancel */
@@ -33,6 +34,9 @@ static atlas_status put_job_submit_args(atlas_json *j, void *ud, atlas_err *err)
     atlas_status st = atlas_json_key_str(j, "repo", a->repo, err);
     if (st == ATLAS_OK && a->task != NULL) {
         st = atlas_json_key_str(j, "task", a->task, err);
+    }
+    if (st == ATLAS_OK && a->model != NULL) {
+        st = atlas_json_key_str(j, "model", a->model, err);
     }
     if (st == ATLAS_OK && a->key != NULL) {
         st = atlas_json_key_str(j, "key", a->key, err);
@@ -105,6 +109,11 @@ atlas_status atlas_mcp_tools_schema_job_submit(atlas_json *j, atlas_err *err) {
                       40, err);
     }
     if (st == ATLAS_OK) {
+        st = atlas_mcp_tools_prop_str(j, "model",
+                      "optional model name from the operator's remote_submit_model choices; "
+                      "omitting it uses the default driver and role model", 64, err);
+    }
+    if (st == ATLAS_OK) {
         st = atlas_mcp_tools_schema_end(j, REQUIRED, err);
     }
     return st;
@@ -115,7 +124,7 @@ atlas_status atlas_mcp_tools_run_job_submit(atlas_mcp_server *s, const atlas_jso
     /* Enforce additionalProperties: false at runtime. The schema JSON publishes
      * this constraint but atlas_mcp_call_tool does not validate it before
      * calling run(). Check the positive allowlist before reading any arg. */
-    static const char *const ALLOWED[] = {"repo", "task", "key", NULL};
+    static const char *const ALLOWED[] = {"repo", "task", "key", "model", NULL};
     atlas_status st = atlas_jsonv_check_only_keys(args, ALLOWED, err);
     if (st != ATLAS_OK) {
         return st;
@@ -131,6 +140,9 @@ atlas_status atlas_mcp_tools_run_job_submit(atlas_mcp_server *s, const atlas_jso
     }
     if (st == ATLAS_OK) {
         st = atlas_mcp_tools_arg_str(args, "key", 40u, &a.key, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_mcp_tools_arg_str(args, "model", 64u, &a.model, err);
     }
     if (st == ATLAS_OK && s->remote_token.len > 0) {
         a.token = atlas_buf_cstr(&s->remote_token);

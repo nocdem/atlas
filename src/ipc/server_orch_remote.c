@@ -147,6 +147,9 @@ static atlas_status emit_remote_job(const atlas_orch_list_row *row, void *ud, at
         st = atlas_json_key_str(lc->ds->j, "driver", row->driver, err);
     }
     if (st == ATLAS_OK) {
+        st = atlas_json_key_str(lc->ds->j, "model", row->model, err);
+    }
+    if (st == ATLAS_OK) {
         st = atlas_json_key_str(lc->ds->j, "created_at", row->created_at, err);
     }
     if (st == ATLAS_OK) {
@@ -235,12 +238,24 @@ static atlas_status method_remote_submit(dispatch_state *ds, const atlas_ipc_req
                              "the orchestration policy does not permit jobs against that "
                              "repository");
     }
+    const char *requested_model = NULL;
+    if (atlas_ipc_param_present(req, "model") &&
+        (!atlas_ipc_param_str(req, "model", &requested_model) || requested_model == NULL ||
+         requested_model[0] == '\0' || strlen(requested_model) > ATLAS_ORCH_NAME_MAX)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "model must be a nonempty string of at most 64 bytes");
+    }
+    const char *selected_driver = NULL, *selected_model = NULL;
+    st = atlas_orch_remote_select_model(gw, op_orch, requested_model,
+                                        &selected_driver, &selected_model, err);
+    if (st != ATLAS_OK) {
+        return st;
+    }
     /* Cross-check driver against orchpolicy. */
-    if (!atlas_orchpolicy_permits_driver(op_orch, gw->remote_submit_driver)) {
+    if (!atlas_orchpolicy_permits_driver(op_orch, selected_driver)) {
         return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
                              "the remote driver %s is not one /etc/atlas/orchestration.conf "
                              "configures",
-                             gw->remote_submit_driver);
+                             selected_driver);
     }
     /* Cross-check mode against orchpolicy. */
     if (!atlas_orchpolicy_permits_mode(op_orch, gw->remote_submit_mode)) {
@@ -250,12 +265,12 @@ static atlas_status method_remote_submit(dispatch_state *ds, const atlas_ipc_req
                              gw->remote_submit_mode);
     }
     /* Cross-check live_model requirement. */
-    const atlas_driver *drv = atlas_driver_find(gw->remote_submit_driver);
+    const atlas_driver *drv = atlas_driver_find(selected_driver);
     if (drv != NULL && drv->needs_live_model && !op_orch->live_model) {
         return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
                              "the remote driver %s needs a live model and "
                              "/etc/atlas/orchestration.conf has live_model = off",
-                             gw->remote_submit_driver);
+                             selected_driver);
     }
 
     /* Resolve the repository. */
@@ -302,9 +317,13 @@ static atlas_status method_remote_submit(dispatch_state *ds, const atlas_ipc_req
     }
     atlas_repo_info_free(&ri);
 
-    /* Driver, mode and max_attempts come from the gateway policy, never the request. */
+    /* The selected driver/model are resolved from policy choices. Mode and
+     * max_attempts still come from the fixed gateway policy. */
     if (st == ATLAS_OK) {
-        st = atlas_buf_set_str(&op->spec.driver, gw->remote_submit_driver, err);
+        st = atlas_buf_set_str(&op->spec.driver, selected_driver, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_buf_set_str(&op->spec.model, selected_model, err);
     }
     if (st == ATLAS_OK) {
         st = atlas_buf_set_str(&op->spec.mode, gw->remote_submit_mode, err);
@@ -389,6 +408,8 @@ static atlas_status method_remote_submit(dispatch_state *ds, const atlas_ipc_req
     /* Capture values needed for the response before ownership transfers. */
     char resp_driver[ATLAS_ORCH_NAME_MAX + 1u];
     char resp_mode[ATLAS_ORCH_NAME_MAX + 1u];
+    char resp_model[ATLAS_ORCH_NAME_MAX + 1u];
+    (void)snprintf(resp_model, sizeof(resp_model), "%s", selected_model);
     int64_t resp_max_attempts = op->spec.max_attempts;
     (void)snprintf(resp_driver, sizeof(resp_driver), "%s",
                    atlas_buf_cstr(&op->spec.driver));
@@ -415,6 +436,9 @@ static atlas_status method_remote_submit(dispatch_state *ds, const atlas_ipc_req
         }
         if (st == ATLAS_OK) {
             st = atlas_json_key_str(ds->j, "driver", resp_driver, err);
+        }
+        if (st == ATLAS_OK) {
+            st = atlas_json_key_str(ds->j, "model", resp_model, err);
         }
         if (st == ATLAS_OK) {
             st = atlas_json_key_str(ds->j, "mode", resp_mode, err);
@@ -516,6 +540,9 @@ static atlas_status method_remote_get(dispatch_state *ds, const atlas_ipc_reques
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_str(ds->j, "driver", v.driver, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(ds->j, "model", v.model, err);
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_str(ds->j, "spec_digest", v.spec_digest, err);

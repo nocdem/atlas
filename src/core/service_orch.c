@@ -94,7 +94,7 @@ static void fill_render(const atlas_ipc_response *r, atlas_job_render *jr, bool 
         const char *key;
     } strs[] = {
         {&jr->job, "job"},        {&jr->state, "state"},
-        {&jr->repo, "repo"},      {&jr->driver, "driver"},
+        {&jr->repo, "repo"},      {&jr->driver, "driver"}, {&jr->model, "model"},
         {&jr->commit, "commit"},  {&jr->created_at, "created_at"},
         {&jr->terminal_at, "terminal_at"}, {&jr->spec_digest, "spec_digest"},
         {&jr->task, "task"},      {&jr->run, "run"},
@@ -341,6 +341,7 @@ static atlas_status forward_row(const atlas_ipc_response *r, size_t index, void 
     (void)atlas_ipc_result_arr_obj_str(r, "jobs", index, "state", &jr.state);
     (void)atlas_ipc_result_arr_obj_str(r, "jobs", index, "repo", &jr.repo);
     (void)atlas_ipc_result_arr_obj_str(r, "jobs", index, "driver", &jr.driver);
+    (void)atlas_ipc_result_arr_obj_str(r, "jobs", index, "model", &jr.model);
     (void)atlas_ipc_result_arr_obj_str(r, "jobs", index, "created_at", &jr.created_at);
     (void)atlas_ipc_result_arr_obj_int(r, "jobs", index, "attempts", &jr.attempts);
     /* A14. key_id is present on remote jobs; absent on local ones. Borrowed. */

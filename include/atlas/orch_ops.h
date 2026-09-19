@@ -388,6 +388,7 @@ typedef struct atlas_orch_result {
     atlas_buf source_commit;
     atlas_buf mode;
     atlas_buf driver;
+    atlas_buf model;
     atlas_buf task_text;
     atlas_buf allowed_paths;
     atlas_buf validations;
@@ -495,6 +496,7 @@ typedef struct atlas_orch_job_view {
     char source_commit[41];
     char mode[ATLAS_ORCH_NAME_MAX + 1u];
     char driver[ATLAS_ORCH_NAME_MAX + 1u];
+    char model[ATLAS_ORCH_NAME_MAX + 1u];
     char spec_digest[65];
     char correlation[ATLAS_ORCH_NAME_MAX + 1u];
     long long submitter_uid;
@@ -653,6 +655,7 @@ typedef struct atlas_orch_list_row {
     atlas_orch_state state;
     char repo_name[ATLAS_ORCH_NAME_MAX + 1u];
     char driver[ATLAS_ORCH_NAME_MAX + 1u];
+    char model[ATLAS_ORCH_NAME_MAX + 1u];
     char created_at[ATLAS_ORCH_TS_MAX];
     int64_t attempts_started;
     /* A14. The selector of the credential that queued this job, or '' for a

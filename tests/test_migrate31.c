@@ -261,12 +261,12 @@ static void test_fresh_database_reaches_31(void) {
     T_OK(open_fresh(&fx, &db, &err), &err);
     T_OK(atlas_db_migrate(db, &err), &err);
 
-    T_EQ_INT((int)ATLAS_SCHEMA_VERSION, 33);
+    T_EQ_INT((int)ATLAS_SCHEMA_VERSION, 34);
     /* A14's migration 32 and A17 T1's migration 33 landed after
      * this suite was written; a fresh database now reaches 33, not 31 -- this
      * suite is still about migration 31's own two columns and rebuild, which
      * neither later migration touches. */
-    T_EQ_INT(schema_of(db), 33);
+    T_EQ_INT(schema_of(db), ATLAS_SCHEMA_VERSION);
 
     T_CHECK(column_exists(db, "decision_events", "key_id"));
     T_CHECK(column_exists(db, "decision_challenges", "channel"));
@@ -532,7 +532,7 @@ static void test_widened_check_vocabularies_are_pinned_to_the_c_enum(void) {
     T_OK(atlas_db_migrate(db, &err), &err);
     /* Migration 33 (A17 T1) landed after this suite was written, so
      * a fresh database migrated to head now reaches 33, not 32. */
-    T_EQ_INT(schema_of(db), 33);
+    T_EQ_INT(schema_of(db), ATLAS_SCHEMA_VERSION);
 
     int64_t doc_id = 0, rev_id = 0;
     seed_doc_and_revision(db, "0000000000000000000vocab1", &doc_id, &rev_id);
@@ -791,7 +791,7 @@ static void test_a_lossy_migration_31_is_refused_and_rolled_back(void) {
      * left a recoverable state, not a wedged one. Migration 33 (remote deploy
      * T1) landed after this suite was written, so this now reaches 33. */
     T_OK(atlas_db_migrate(db, &err), &err);
-    T_EQ_INT(schema_of(db), 33);
+    T_EQ_INT(schema_of(db), ATLAS_SCHEMA_VERSION);
     T_EQ_INT((int)count_sql(db, "SELECT COUNT(*) FROM decision_events;"), 3);
 
     atlas_db_close(db);
@@ -856,7 +856,7 @@ static void test_a_lossy_challenges_rebuild_is_refused_and_rolled_back(void) {
     /* Migration 33 (A17 T1) landed after this suite was written, so
      * this now reaches 33. */
     T_OK(atlas_db_migrate(db, &err), &err);
-    T_EQ_INT(schema_of(db), 33);
+    T_EQ_INT(schema_of(db), ATLAS_SCHEMA_VERSION);
     T_EQ_INT((int)count_sql(db, "SELECT COUNT(*) FROM decision_challenges;"), 2);
 
     atlas_db_close(db);

@@ -112,6 +112,10 @@ session_ttl_seconds = 43200
 # remote_submit_key          = key_b2578f48143c06d3
 # remote_submit_key          = key_<the browser's own --no-scopes key>
 # remote_submit_driver       = claude
+# Optional choices for atlas_job_submit(model=...). Both drivers must also be
+# enabled by orchestration policy; Codex refuses a positive dollar budget.
+# remote_submit_model        = codex:gpt-6-astra
+# remote_submit_model        = claude:sonnet
 # remote_submit_mode         = patch
 # remote_submit_gate         = make
 # remote_submit_max_attempts = 1

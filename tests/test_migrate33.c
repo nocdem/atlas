@@ -159,8 +159,8 @@ static void test_fresh_database_reaches_33(void) {
     T_OK(open_fresh(&fx, &db, &err), &err);
     T_OK(atlas_db_migrate(db, &err), &err);
 
-    T_EQ_INT((int)ATLAS_SCHEMA_VERSION, 33);
-    T_EQ_INT(schema_of(db), 33);
+    T_EQ_INT((int)ATLAS_SCHEMA_VERSION, 34);
+    T_EQ_INT(schema_of(db), ATLAS_SCHEMA_VERSION);
 
     for (size_t i = 0; i < sizeof(TABLES) / sizeof(TABLES[0]); i++) {
         T_CHECK_MSG(table_exists(db, TABLES[i]), "migration 33 did not create %s", TABLES[i]);

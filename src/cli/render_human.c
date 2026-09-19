@@ -588,6 +588,9 @@ static atlas_status h_job_item(atlas_renderer *r, const atlas_job_render *jr, at
     (void)fprintf(out, "repository    %s\n", jr->repo);
     (void)fprintf(out, "commit        %s\n", jr->commit);
     (void)fprintf(out, "driver        %s\n", jr->driver);
+    if (jr->model != NULL && jr->model[0] != '\0') {
+        (void)fprintf(out, "model         %s\n", jr->model);
+    }
     (void)fprintf(out, "attempts      %lld of %lld\n", (long long)jr->attempts,
                   (long long)jr->max_attempts);
     (void)fprintf(out, "spec digest   %s\n", jr->spec_digest);

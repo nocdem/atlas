@@ -164,12 +164,12 @@ typedef struct atlas_orchpolicy {
      * Until this season a worker ran on whatever the account's own session
      * defaulted to, and nothing could choose otherwise — recorded as a residual
      * and closed here. The choice lives in the root-owned policy rather than in
-     * `src/` or in a submission, for the reason every other model decision does:
-     * the principal it constrains is the worker, and a value a submitter could
-     * name would let a task choose what it is judged by.
+     * `src/`. Remote submissions may now select an explicit gateway-policy
+     * choice; an arbitrary model or driver remains unavailable to the caller.
      *
      * A *role* is a property of the driver — `atlas_driver.role` — so the policy
-     * names a model per role and never per job. Empty is unset and is the
+     * names a default model per role. A pinned remote job selection overrides
+     * this default. Empty is unset and is the
      * ordinary state: no flag is passed and the behaviour is what shipped
      * before. Both keys are optional, so a policy written before A12.0 is still
      * a complete policy. */

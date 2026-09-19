@@ -329,6 +329,7 @@ void atlas_orch_spec_init(atlas_orch_spec *s) {
     atlas_buf_init(&s->source_commit);
     atlas_buf_init(&s->mode);
     atlas_buf_init(&s->driver);
+    atlas_buf_init(&s->model);
     atlas_buf_init(&s->task_text);
     atlas_buf_init(&s->correlation);
     atlas_buf_init(&s->parent_job_uid);
@@ -350,6 +351,7 @@ void atlas_orch_spec_free(atlas_orch_spec *s) {
     atlas_buf_free(&s->source_commit);
     atlas_buf_free(&s->mode);
     atlas_buf_free(&s->driver);
+    atlas_buf_free(&s->model);
     atlas_buf_free(&s->task_text);
     atlas_buf_free(&s->correlation);
     atlas_buf_free(&s->parent_job_uid);
@@ -526,6 +528,9 @@ atlas_status atlas_orch_spec_validate(const atlas_orch_spec *s, atlas_err *err) 
     }
     if (!is_name(atlas_buf_cstr(&s->driver), s->driver.len)) {
         return atlas_err_set(err, ATLAS_ERR_USAGE, "the driver is not a valid name");
+    }
+    if (s->model.len > 0 && !is_name(atlas_buf_cstr(&s->model), s->model.len)) {
+        return atlas_err_set(err, ATLAS_ERR_USAGE, "the model is not a valid name");
     }
     if (s->task_text.len == 0) {
         return atlas_err_set(err, ATLAS_ERR_USAGE, "a job needs task text");
@@ -866,6 +871,7 @@ atlas_status atlas_orch_spec_digest(const atlas_orch_spec *s, char out[65], atla
     feed_buf(&h, &s->source_commit);
     feed_buf(&h, &s->mode);
     feed_buf(&h, &s->driver);
+    feed_buf(&h, &s->model);
     feed_buf(&h, &s->task_text);
     feed_i64(&h, (int64_t)s->allowed_path_count);
     for (size_t i = 0; i < s->allowed_path_count; i++) {

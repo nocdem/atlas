@@ -1070,7 +1070,7 @@ static const api_route API_WRITE_ROUTES[] = {
      * enough for a percent-encoded task (3 × ATLAS_ORCH_TASK_MAX); the three
      * read/cancel routes stay at the small floor. */
     {"/api/v1/job/submit", "job.remote_submit", ATLAS_SCOPE_JOBS_SUBMIT,
-     {"repo", "task", "key", NULL}, {NULL}, ATLAS_GW_SUBMIT_BODY_MAX_BYTES},
+     {"repo", "task", "key", "model", NULL}, {NULL}, ATLAS_GW_SUBMIT_BODY_MAX_BYTES},
     {"/api/v1/job/get", "job.remote_get", ATLAS_SCOPE_JOBS_SUBMIT,
      {"job", NULL}, {NULL}, ATLAS_GW_WRITE_BODY_MAX_BYTES},
     /* A14R. The one read that returns bytes a worker's run produced. It takes
@@ -2701,6 +2701,21 @@ atlas_status atlas_service_gateway_status_for(FILE *out, bool json, const atlas_
                 st = atlas_json_key_str(j, "remote_submit_driver", p->remote_submit_driver, err);
             }
             if (st == ATLAS_OK) {
+                st = atlas_json_key(j, "remote_submit_models", err);
+                if (st == ATLAS_OK) { st = atlas_json_arr_begin(j, err); }
+                for (size_t mi = 0; st == ATLAS_OK && mi < p->remote_submit_model_count; mi++) {
+                    st = atlas_json_obj_begin(j, err);
+                    if (st == ATLAS_OK) {
+                        st = atlas_json_key_str(j, "driver", p->remote_submit_models[mi].driver, err);
+                    }
+                    if (st == ATLAS_OK) {
+                        st = atlas_json_key_str(j, "model", p->remote_submit_models[mi].model, err);
+                    }
+                    if (st == ATLAS_OK) { st = atlas_json_obj_end(j, err); }
+                }
+                if (st == ATLAS_OK) { st = atlas_json_arr_end(j, err); }
+            }
+            if (st == ATLAS_OK) {
                 st = atlas_json_key_str(j, "remote_submit_mode", p->remote_submit_mode, err);
             }
             if (st == ATLAS_OK) {
@@ -2865,6 +2880,11 @@ atlas_status atlas_service_gateway_status_for(FILE *out, bool json, const atlas_
                               p->remote_submit_driver, p->remote_submit_mode,
                               p->remote_submit_gate_count, p->remote_submit_max_attempts,
                               p->remote_submit_max_active, total, per_day);
+                for (size_t mi = 0; mi < p->remote_submit_model_count; mi++) {
+                    (void)fprintf(out, "model:   %s via %s (checked at submit)\n",
+                                  p->remote_submit_models[mi].model,
+                                  p->remote_submit_models[mi].driver);
+                }
             } else {
                 (void)fprintf(out,
                               "submit:  (none -- nothing reachable over the network can queue a "

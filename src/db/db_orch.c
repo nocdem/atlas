@@ -154,6 +154,7 @@ void atlas_orch_result_init(atlas_orch_result *r) {
     atlas_buf_init(&r->source_commit);
     atlas_buf_init(&r->mode);
     atlas_buf_init(&r->driver);
+    atlas_buf_init(&r->model);
     atlas_buf_init(&r->task_text);
     atlas_buf_init(&r->allowed_paths);
     atlas_buf_init(&r->validations);
@@ -175,6 +176,7 @@ void atlas_orch_result_free(atlas_orch_result *r) {
     atlas_buf_free(&r->source_commit);
     atlas_buf_free(&r->mode);
     atlas_buf_free(&r->driver);
+    atlas_buf_free(&r->model);
     atlas_buf_free(&r->task_text);
     atlas_buf_free(&r->allowed_paths);
     atlas_buf_free(&r->validations);
@@ -196,6 +198,7 @@ typedef struct job_row {
     char source_commit[41];
     char mode[ATLAS_ORCH_NAME_MAX + 1u];
     char driver[ATLAS_ORCH_NAME_MAX + 1u];
+    char model[ATLAS_ORCH_NAME_MAX + 1u];
     char spec_digest[ATLAS_SHA256_HEX_LEN + 1u];
     int64_t submitter_uid;
     int64_t attempts_started;
@@ -281,8 +284,9 @@ static atlas_status job_fill(atlas_db *db, sqlite3_stmt *st, job_row *j, atlas_e
     if (s != ATLAS_OK) {
         return s;
     }
+    s = atlas_db_col_copy(st, 23, j->model, sizeof(j->model), "model", err);
     (void)db;
-    return ATLAS_OK;
+    return s;
 }
 
 static atlas_status job_by_uid(atlas_db *db, const char *uid, job_row *j, bool *found,
@@ -292,7 +296,7 @@ static atlas_status job_by_uid(atlas_db *db, const char *uid, job_row *j, bool *
         "       driver, spec_digest, submitter_uid, attempts_started, max_attempts,"
         "       wall_timeout_ms, idle_timeout_ms, max_output_bytes, max_artifact_bytes,"
         "       max_artifact_count, deadline_ms, cancel_requested, run_uid, parent_job_uid,"
-        "       submit_key_id"
+        "       submit_key_id, model"
         "  FROM orch_jobs WHERE job_uid = ?1;";
     *found = false;
     sqlite3_stmt *st = NULL;
@@ -322,7 +326,7 @@ static atlas_status job_by_id(atlas_db *db, int64_t id, job_row *j, bool *found,
         "       driver, spec_digest, submitter_uid, attempts_started, max_attempts,"
         "       wall_timeout_ms, idle_timeout_ms, max_output_bytes, max_artifact_bytes,"
         "       max_artifact_count, deadline_ms, cancel_requested, run_uid, parent_job_uid,"
-        "       submit_key_id"
+        "       submit_key_id, model"
         "  FROM orch_jobs WHERE id = ?1;";
     *found = false;
     sqlite3_stmt *st = NULL;
@@ -1474,9 +1478,9 @@ static atlas_status op_submit(atlas_db *db, const atlas_orch_op *op, atlas_orch_
             "  allowed_paths, validations, wall_timeout_ms, idle_timeout_ms, max_attempts,"
             "  max_output_bytes, max_artifact_bytes, max_artifact_count, correlation,"
             "  parent_job_uid, idempotency_key, state, created_at, created_ms, deadline_ms,"
-            "  run_uid, run_slot, submit_key_id)"
+            "  run_uid, run_slot, submit_key_id, model)"
             " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,"
-            "        ?21,?22,'QUEUED',?23,?24,?25,?26,?27,?28);";
+            "        ?21,?22,'QUEUED',?23,?24,?25,?26,?27,?28,?29);";
         sqlite3_stmt *q = NULL;
         st = atlas_db_prepare(db, INS, &q, err);
         if (st != ATLAS_OK) {
@@ -1496,6 +1500,7 @@ static atlas_status op_submit(atlas_db *db, const atlas_orch_op *op, atlas_orch_
             {8, atlas_buf_cstr(&s->source_commit)},
             {9, atlas_buf_cstr(&s->mode)},
             {10, atlas_buf_cstr(&s->driver)},
+            {29, atlas_buf_cstr(&s->model)},
             {12, atlas_buf_cstr(&paths)},
             {13, atlas_buf_cstr(&vals)},
             {20, atlas_buf_cstr(&s->correlation)},
@@ -2142,6 +2147,7 @@ static atlas_status op_lease(atlas_db *db, const atlas_orch_op *op, atlas_orch_r
         {&out->source_commit, j.source_commit},
         {&out->mode, j.mode},
         {&out->driver, j.driver},
+        {&out->model, j.model},
         /* A12.1 T13. Not read anywhere else in this function, but `run_orch`
          * (`src/daemon/writer.c`) needs it after this transaction commits, to
          * re-read the pack row and compute its delivery-time freshness with no
@@ -2797,6 +2803,9 @@ static atlas_status spawn_follow_up(atlas_db *db, const atlas_orch_op *op, const
         }
         if (s == ATLAS_OK) {
             s = atlas_buf_set_str(&cs->driver, parent->driver, err);
+        }
+        if (s == ATLAS_OK) {
+            s = atlas_buf_set_str(&cs->model, parent->model, err);
         }
         if (s == ATLAS_OK) {
             s = atlas_buf_set_str(&cs->correlation, atlas_buf_cstr(&pspec.correlation), err);
@@ -3840,7 +3849,7 @@ atlas_status atlas_db_orch_job_get(atlas_db *db, const char *uid, atlas_orch_job
         "SELECT job_uid, state, repo_name, source_commit, mode, driver, spec_digest,"
         "       submitter_uid, attempts_started, max_attempts, created_at, terminal_at,"
         "       cancel_requested, state_seq, task_text, correlation, wall_timeout_ms,"
-        "       idle_timeout_ms, run_uid, parent_job_uid, submit_key_id"
+        "       idle_timeout_ms, run_uid, parent_job_uid, submit_key_id, model"
         "  FROM orch_jobs WHERE job_uid = ?1;";
     *found = false;
     memset(out, 0, sizeof(*out));
@@ -3913,7 +3922,8 @@ atlas_status atlas_db_orch_job_get(atlas_db *db, const char *uid, atlas_orch_job
                                   "submit_key_id", err);
         }
         if (s == ATLAS_OK) {
-            *found = true;
+            s = atlas_db_col_copy(st, 21, out->model, sizeof(out->model), "model", err);
+            *found = (s == ATLAS_OK);
         }
     }
     atlas_db_finish(db, st);
@@ -4279,7 +4289,7 @@ atlas_status atlas_db_orch_job_list(atlas_db *db, long long submitter_uid, int64
     }
     static const char SQL[] =
         "SELECT id, job_uid, state, repo_name, driver, created_at, attempts_started,"
-        "       submit_key_id"
+        "       submit_key_id, model"
         "  FROM orch_jobs WHERE submitter_uid = ?1 AND id > ?2 ORDER BY id LIMIT ?3;";
     sqlite3_stmt *st = NULL;
     atlas_status s = atlas_db_prepare(db, SQL, &st, err);
@@ -4316,6 +4326,10 @@ atlas_status atlas_db_orch_job_list(atlas_db *db, long long submitter_uid, int64
             s = atlas_db_col_copy(st, 7, row.submit_key_id, sizeof(row.submit_key_id),
                                   "submit_key_id", err);
         }
+        if (s != ATLAS_OK) {
+            break;
+        }
+        s = atlas_db_col_copy(st, 8, row.model, sizeof(row.model), "model", err);
         if (s != ATLAS_OK) {
             break;
         }
@@ -4381,6 +4395,10 @@ static atlas_status orch_job_list_impl(atlas_db *db, sqlite3_stmt *st, int64_t a
         if (s != ATLAS_OK) {
             break;
         }
+        s = atlas_db_col_copy(st, 8, row.model, sizeof(row.model), "model", err);
+        if (s != ATLAS_OK) {
+            break;
+        }
         row.attempts_started = sqlite3_column_int64(st, 6);
         cursor = row.id;
         n++;
@@ -4413,7 +4431,7 @@ atlas_status atlas_db_orch_job_list_by_key(atlas_db *db, const char *key_id, int
     }
     static const char SQL[] =
         "SELECT id, job_uid, state, repo_name, driver, created_at, attempts_started,"
-        "       submit_key_id"
+        "       submit_key_id, model"
         "  FROM orch_jobs WHERE submit_key_id = ?1 AND id > ?2 ORDER BY id LIMIT ?3;";
     sqlite3_stmt *st = NULL;
     atlas_status s = atlas_db_prepare(db, SQL, &st, err);
@@ -4441,7 +4459,7 @@ atlas_status atlas_db_orch_job_list_remote(atlas_db *db, int64_t after_id, int64
     }
     static const char SQL[] =
         "SELECT id, job_uid, state, repo_name, driver, created_at, attempts_started,"
-        "       submit_key_id"
+        "       submit_key_id, model"
         "  FROM orch_jobs WHERE submit_key_id <> '' AND id > ?1 ORDER BY id LIMIT ?2;";
     sqlite3_stmt *st = NULL;
     atlas_status s = atlas_db_prepare(db, SQL, &st, err);

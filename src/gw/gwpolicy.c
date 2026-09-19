@@ -657,6 +657,30 @@ void atlas_gwpolicy_parse_buffer(const char *buf, size_t total, atlas_gwpolicy *
             memcpy(out->remote_submit_keys[out->remote_submit_count], parsed,
                    ATLAS_APIKEY_SELECTOR_HEX + 1u);
             out->remote_submit_count++;
+        } else if (take_value(line, len, "remote_submit_model", &val, &vlen)) {
+            /* DRIVER:MODEL; choices only select isolated executor drivers. */
+            const char *sep = memchr(val, ':', vlen);
+            size_t dn = sep != NULL ? (size_t)(sep - val) : 0;
+            size_t mn = sep != NULL ? vlen - dn - 1u : 0;
+            if (out->remote_submit_model_count >= 16u ||
+                !is_submit_name(val, dn) || !is_submit_name(sep + 1, mn) ||
+                !((dn == 6u && memcmp(val, "claude", 6u) == 0) ||
+                  (dn == 5u && memcmp(val, "codex", 5u) == 0))) {
+                out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                return;
+            }
+            for (size_t k = 0; k < out->remote_submit_model_count; k++) {
+                if (strlen(out->remote_submit_models[k].model) == mn &&
+                    memcmp(out->remote_submit_models[k].model, sep + 1, mn) == 0) {
+                    out->reason = ATLAS_GWPOLICY_REASON_MALFORMED;
+                    return;
+                }
+            }
+            size_t k = out->remote_submit_model_count++;
+            (void)copy_value(out->remote_submit_models[k].driver,
+                             sizeof out->remote_submit_models[k].driver, val, dn);
+            (void)copy_value(out->remote_submit_models[k].model,
+                             sizeof out->remote_submit_models[k].model, sep + 1, mn);
         } else if (take_value(line, len, "remote_submit_driver", &val, &vlen)) {
             /* A14: the driver the submitted job runs under. Singleton. Name
              * shape: [a-z0-9._-], at most ATLAS_ORCH_NAME_MAX bytes.
@@ -930,7 +954,8 @@ void atlas_gwpolicy_parse_buffer(const char *buf, size_t total, atlas_gwpolicy *
      * The acceptance key (`operator_accepts_cleartext_submission`) is separate
      * and may be absent even when the rest are present (under REVERSE_PROXY). */
     {
-        bool any_submit = (out->remote_submit_count > 0) || submit_driver_given ||
+        bool any_submit = (out->remote_submit_model_count > 0) ||
+                          (out->remote_submit_count > 0) || submit_driver_given ||
                           submit_mode_given || submit_gate_given || submit_attempts_given ||
                           submit_active_given || submit_per_day_given;
         bool all_submit = (out->remote_submit_count > 0) && submit_driver_given &&

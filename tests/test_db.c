@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "atlas/atlas.h"
+#include "atlas/orch_ops.h"
 #include "atlas_test.h"
 #include "db/db_internal.h"
 #include "support/fixture.h"
@@ -591,7 +592,113 @@ static void test_binary_paths_round_trip(void) {
     db_env_close(&e);
 }
 
+
+
+static void test_job_model_upgrade(void) {
+    db_env e;
+    memset(&e, 0, sizeof(e));
+    db_env_open(&e, false);
+    atlas_err err;
+    atlas_err_init(&err);
+    size_t count = 0;
+    const atlas_migration *migrations = atlas_migrations(&count);
+    T_REQUIRE(count == 34u);
+    T_OK(atlas_db_migrate_list(e.db, migrations, 33u, &err), &err);
+    T_OK(atlas_db_exec_sql(e.db,
+        "INSERT INTO orch_jobs(job_uid,spec_version,spec_digest,submitter_uid,repo_name,"
+        "repo_identity_hash,source_commit,mode,driver,task_text,allowed_paths,validations,"
+        "wall_timeout_ms,idle_timeout_ms,max_attempts,max_output_bytes,max_artifact_bytes,"
+        "max_artifact_count,state,created_at,created_ms,deadline_ms) VALUES("
+        "'legacy',1,'original-digest',1000,'proj','identity','commit','patch','claude',"
+        "'task','','',60000,30000,1,65536,65536,8,'QUEUED','2026-09-19',1,60001);", &err), &err);
+    T_OK(atlas_db_migrate(e.db, &err), &err);
+    T_EQ_INT(count_sql(e.db, "SELECT count(*) FROM orch_jobs WHERE job_uid='legacy' "
+                      "AND model='' AND spec_version=1 AND spec_digest='original-digest' "
+                      "AND state='QUEUED' AND driver='claude';"), 1);
+    db_env_close(&e);
+}
+
+/* Synthetic repository isolates the durable job contract from scanner ownership. */
+static void test_job_model_persistence(void) {
+    db_env e;
+    memset(&e, 0, sizeof(e));
+    db_env_open(&e, true);
+    atlas_err err;
+    atlas_err_init(&err);
+    int64_t id = 0;
+    T_OK(add_repo(e.db, "proj", "/tmp/model-proj", "/tmp/model-proj/.git",
+                  "/tmp/model-proj/.git", false, "sha1", &id, &err), &err);
+    T_OK(atlas_db_exec_sql(e.db,
+        "INSERT INTO commits(repo_id,oid) SELECT id,"
+        "'0123456789abcdef0123456789abcdef01234567' FROM repositories WHERE name='proj';",
+        &err), &err);
+    atlas_orch_op *op = atlas_orch_op_new(ATLAS_ORCH_OP_SUBMIT);
+    T_REQUIRE(op != NULL);
+    op->repo_id = id;
+    op->peer_uid = 1000;
+    op->actor = ATLAS_ORCH_ACTOR_CLIENT;
+    op->spec.submitter_uid = 1000;
+    T_OK(atlas_buf_set_str(&op->spec.repo_name, "proj", &err), &err);
+    T_OK(atlas_db_repo_identity_hash(e.db, id, &op->spec.repo_identity_hash, &err), &err);
+    T_OK(atlas_buf_set_str(&op->spec.source_commit, "0123456789abcdef0123456789abcdef01234567", &err), &err);
+    T_OK(atlas_buf_set_str(&op->spec.mode, "patch", &err), &err);
+    T_OK(atlas_buf_set_str(&op->spec.driver, "codex", &err), &err);
+    T_OK(atlas_buf_set_str(&op->spec.model, "gpt-6-astra", &err), &err);
+    T_OK(atlas_buf_set_str(&op->spec.task_text, "test task", &err), &err);
+    T_OK(atlas_buf_set_str(&op->spec.idempotency_key, "model-test", &err), &err);
+    op->spec.wall_timeout_ms = 60000;
+    op->spec.idle_timeout_ms = 30000;
+    op->spec.max_attempts = 1;
+    op->spec.max_output_bytes = 65536;
+    op->spec.max_artifact_bytes = 65536;
+    op->spec.max_artifact_count = 8;
+    T_OK(atlas_orch_spec_validate(&op->spec, &err), &err);
+    atlas_orch_result result;
+    atlas_orch_result_init(&result);
+    T_OK(atlas_orch_apply(e.db, op, &result, &err), &err);
+    atlas_buf uid = ATLAS_BUF_INIT;
+    T_OK(atlas_buf_set_str(&uid, atlas_buf_cstr(&result.job_uid), &err), &err);
+    atlas_orch_result_free(&result);
+    atlas_orch_result_init(&result);
+    T_OK(atlas_orch_apply(e.db, op, &result, &err), &err);
+    T_CHECK(result.duplicate);
+    atlas_orch_result_free(&result);
+    atlas_orch_result_init(&result);
+    T_OK(atlas_buf_set_str(&op->spec.model, "another-model", &err), &err);
+    T_CHECK(atlas_orch_apply(e.db, op, &result, &err) != ATLAS_OK);
+    atlas_orch_result_free(&result);
+    atlas_orch_op_free(op);
+    free(op);
+    /* Close/reopen proves the selection is not transient submission state. */
+    atlas_db_close(e.db);
+    T_OK(atlas_db_open(atlas_buf_cstr(&e.path), &e.db, &err), &err);
+    atlas_orch_job_view view;
+    bool found = false;
+    T_OK(atlas_db_orch_job_get(e.db, atlas_buf_cstr(&uid), &view, &found, &err), &err);
+    T_REQUIRE(found);
+    T_CHECK(strcmp(view.driver, "codex") == 0);
+    T_CHECK(strcmp(view.model, "gpt-6-astra") == 0);
+    atlas_buf_free(&view.task_text);
+    op = atlas_orch_op_new(ATLAS_ORCH_OP_LEASE);
+    T_REQUIRE(op != NULL);
+    op->peer_uid = 993;
+    op->actor = ATLAS_ORCH_ACTOR_DISPATCHER;
+    T_OK(atlas_buf_set_str(&op->dispatcher_id, "test-dispatcher", &err), &err);
+    atlas_orch_result_init(&result);
+    T_OK(atlas_orch_apply(e.db, op, &result, &err), &err);
+    T_REQUIRE(result.granted);
+    T_CHECK(strcmp(atlas_buf_cstr(&result.driver), "codex") == 0);
+    T_CHECK(strcmp(atlas_buf_cstr(&result.model), "gpt-6-astra") == 0);
+    atlas_orch_result_free(&result);
+    atlas_orch_op_free(op);
+    free(op);
+    atlas_buf_free(&uid);
+    db_env_close(&e);
+}
+
 static const atlas_test TESTS[] = {
+    {"model migration preserves legacy jobs and their digests", test_job_model_upgrade},
+    {"job model persists into the lease and idempotency contract", test_job_model_persistence},
     {"migrations are idempotent", test_migration_idempotency},
     {"a failed migration is rolled back whole", test_migration_rollback},
     {"out-of-sequence migrations are refused", test_migration_out_of_sequence},

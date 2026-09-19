@@ -278,6 +278,12 @@ typedef struct atlas_gwpolicy {
     char remote_submit_keys[ATLAS_GWPOLICY_MAX_SUBMIT_KEYS][ATLAS_APIKEY_SELECTOR_HEX + 1u];
     size_t remote_submit_count;                              /* 0 = remote submission off */
     char remote_submit_driver[ATLAS_ORCH_NAME_MAX + 1u];
+    /* At most 16 explicit model choices, bounded policy memory and lookup. */
+    struct {
+        char driver[ATLAS_ORCH_NAME_MAX + 1u];
+        char model[ATLAS_ORCH_NAME_MAX + 1u];
+    } remote_submit_models[16];
+    size_t remote_submit_model_count;
     char remote_submit_mode[ATLAS_ORCH_NAME_MAX + 1u];
     char remote_submit_gates[ATLAS_ORCH_MAX_VALIDATIONS][ATLAS_GWPOLICY_GATE_LINE_MAX];
     size_t remote_submit_gate_count;

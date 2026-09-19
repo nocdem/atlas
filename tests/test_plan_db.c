@@ -675,7 +675,7 @@ static void test_migration_25_adds_its_tables_and_the_correlation_index(void) {
     T_EQ_INT(atlas_db_schema_version(e.db, &err), ATLAS_SCHEMA_VERSION);
     /* Migrations 32 (A14's T2) and 33 (A17 T1) landed after this
      * suite was written. */
-    T_EQ_INT(ATLAS_SCHEMA_VERSION, 33);
+    T_EQ_INT(ATLAS_SCHEMA_VERSION, 34);
 
     T_CHECK(object_exists(e.db, "table", "orch_plans"));
     T_CHECK(object_exists(e.db, "table", "orch_plan_revisions"));

@@ -149,3 +149,34 @@ atlas_status atlas_orch_remote_idempotency_key(const char *key_id, const char *c
     atlas_buf_reset(out);
     return atlas_buf_appendf(out, err, "remote.%s.%s", key_id, client);
 }
+
+atlas_status atlas_orch_remote_select_model(const atlas_gwpolicy *gw,
+                                            const atlas_orchpolicy *orch,
+                                            const char *requested,
+                                            const char **driver, const char **model,
+                                            atlas_err *err) {
+    *driver = gw->remote_submit_driver;
+    *model = "";
+    if (requested == NULL) {
+        return ATLAS_OK;
+    }
+    for (size_t i = 0; i < gw->remote_submit_model_count; i++) {
+        if (strcmp(requested, gw->remote_submit_models[i].model) != 0) {
+            continue;
+        }
+        const char *d = gw->remote_submit_models[i].driver;
+        if (!atlas_orchpolicy_permits_driver(orch, d) || !orch->live_model) {
+            return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                                 "the selected model's driver is not enabled by orchestration policy");
+        }
+        if (strcmp(d, "codex") == 0 && orch->max_cost_cents > 0) {
+            return atlas_err_set(err, ATLAS_ERR_INTEGRITY,
+                                 "Codex cannot enforce the configured dollar budget; nothing was queued");
+        }
+        *driver = d;
+        *model = gw->remote_submit_models[i].model;
+        return ATLAS_OK;
+    }
+    return atlas_err_set(err, ATLAS_ERR_USAGE,
+                         "that model is not a remote_submit_model choice in gateway policy");
+}

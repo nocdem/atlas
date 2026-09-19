@@ -219,8 +219,8 @@ static void test_fresh_database_reaches_32(void) {
      * a fresh database now reaches 33, not 32 -- this suite is still about
      * migration 32's own two columns and index, which migration 33 does not
      * touch. */
-    T_EQ_INT((int)ATLAS_SCHEMA_VERSION, 33);
-    T_EQ_INT(schema_of(db), 33);
+    T_EQ_INT((int)ATLAS_SCHEMA_VERSION, 34);
+    T_EQ_INT(schema_of(db), ATLAS_SCHEMA_VERSION);
 
     T_CHECK(column_exists(db, "orch_jobs", "submit_key_id"));
     T_CHECK(column_exists(db, "orch_transitions", "key_id"));

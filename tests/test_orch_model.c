@@ -421,6 +421,7 @@ static void test_the_digest_is_stable_and_covers_what_it_claims(void) {
                       &err));
     MUTATE_CHECK("the mode", T_OK(atlas_buf_set_str(&m.mode, "review", &err), &err));
     MUTATE_CHECK("the driver", T_OK(atlas_buf_set_str(&m.driver, "claude", &err), &err));
+    MUTATE_CHECK("the selected model", T_OK(atlas_buf_set_str(&m.model, "gpt-6-astra", &err), &err));
     MUTATE_CHECK("the task text",
                  T_OK(atlas_buf_set_str(&m.task_text, "add a comment.", &err), &err));
     MUTATE_CHECK("the wall timeout", m.wall_timeout_ms = 60001);

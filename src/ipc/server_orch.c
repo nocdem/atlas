@@ -541,7 +541,7 @@ static atlas_status method_job_get(dispatch_state *ds, const atlas_ipc_request *
     } strs[] = {
         {"job", v.job_uid},        {"state", atlas_orch_state_name(v.state)},
         {"repo", v.repo_name},     {"commit", v.source_commit},
-        {"mode", v.mode},          {"driver", v.driver},
+        {"mode", v.mode},          {"driver", v.driver}, {"model", v.model},
         {"spec_digest", v.spec_digest}, {"created_at", v.created_at},
     };
     for (size_t i = 0; st == ATLAS_OK && i < sizeof strs / sizeof strs[0]; i++) {
@@ -603,6 +603,9 @@ static atlas_status emit_job(const atlas_orch_list_row *row, void *ud, atlas_err
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_str(lc->ds->j, "driver", row->driver, err);
+    }
+    if (st == ATLAS_OK) {
+        st = atlas_json_key_str(lc->ds->j, "model", row->model, err);
     }
     if (st == ATLAS_OK) {
         st = atlas_json_key_str(lc->ds->j, "created_at", row->created_at, err);
@@ -1890,6 +1893,7 @@ static atlas_status method_dispatch_lease(dispatch_state *ds, const atlas_ipc_re
             {"commit", atlas_buf_cstr(&r.source_commit)},
             {"mode", atlas_buf_cstr(&r.mode)},
             {"driver", atlas_buf_cstr(&r.driver)},
+            {"model", atlas_buf_cstr(&r.model)},
             {"allowed_paths", atlas_buf_cstr(&r.allowed_paths)},
             {"validations", atlas_buf_cstr(&r.validations)},
             {"spec_digest", r.spec_digest},

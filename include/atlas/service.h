@@ -1201,6 +1201,7 @@ typedef struct atlas_job_render {
     const char *state;
     const char *repo;
     const char *driver;
+    const char *model;
     const char *commit;
     const char *created_at;
     const char *terminal_at;

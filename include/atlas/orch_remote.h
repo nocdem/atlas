@@ -14,6 +14,8 @@
 
 #include "atlas/apikey.h" /* ATLAS_APIKEY_SELECTOR_HEX */
 #include "atlas/atlas.h"  /* atlas_buf, atlas_status, atlas_err */
+#include "atlas/gwpolicy.h"
+#include "atlas/orchpolicy.h"
 #include "atlas/db.h"     /* atlas_db */
 
 /* Verifies that `token` resolves to an active Atlas API key whose id is a
@@ -48,3 +50,11 @@ atlas_status atlas_orch_remote_verify(atlas_db *db, const atlas_buf *token,
  * `"remote." (7) + 16 hex + "." (1) + 40 = 64 == ATLAS_ORCH_NAME_MAX`. */
 atlas_status atlas_orch_remote_idempotency_key(const char *key_id, const char *client,
                                                atlas_buf *out, atlas_err *err);
+
+/* Resolve only root-configured choices; returned pointers borrow the policies.
+ * NULL request preserves role-default behavior. No credential authority is granted. */
+atlas_status atlas_orch_remote_select_model(const atlas_gwpolicy *gw,
+                                            const atlas_orchpolicy *orch,
+                                            const char *requested,
+                                            const char **driver, const char **model,
+                                            atlas_err *err);

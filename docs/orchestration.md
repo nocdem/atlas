@@ -1626,3 +1626,53 @@ known incomplete) stay distinguishable on both renderers.
 **No new RPC method, no MCP tool, no gateway route.** A pack is frozen on a
 submission an operator already made and delivered on a lease Atlas already
 grants; nothing here opens a new door to ask for one directly.
+
+
+## Codex and Astra isolated jobs
+
+`codex` is an EXECUTOR-role driver; `codex-plan` is a PLANNER-role driver.
+Both use the installed Codex CLI in an Atlas snapshot workspace. The existing
+`executor_model` / `planner_model` policy fields select the model, for example
+`gpt-6-astra`; Atlas does not hardcode a model or infer account availability.
+An unset model uses the CLI's default. Driver names must be explicitly allowed
+by the operator's existing `driver =` policy, and `live_model = on` is required.
+
+This support uses `model_credential = operator_session` only. Codex authenticates
+through the model dispatcher's existing HOME; Atlas neither reads nor copies
+credentials. Service credentials, API-key environment forwarding, and arbitrary
+CODEX_HOME overrides are unsupported. The operator must install `codex` in
+`/usr/local/bin`, `/usr/bin`, or `/bin` and provide a working CLI login for the
+model dispatcher. No installation, login, or policy change happens automatically.
+
+Codex runs noninteractively with `--json --ephemeral --skip-git-repo-check`,
+`--sandbox workspace-write`, and `--ask-for-approval never`. The explicit
+artifact directory is additionally writable so planner output can be collected.
+The Git check is skipped because Atlas snapshots deliberately contain no `.git`.
+Tasks follow `--` as one argument, including tasks beginning with option syntax.
+Existing account/service isolation remains required; the CLI sandbox does not
+replace Atlas's OS separation or gates.
+
+**A configured nonzero `max_cost_usd` refuses before execution.** Codex currently
+has no equivalent to Claude's per-invocation `--max-budget-usd`. Atlas does not
+silently discard that bound or turn it into a different limit. An operator who
+requires a dollar ceiling must retain a driver that supports it. Choosing an
+unbounded dollar policy is a separate operator decision, never something the
+submitter or driver changes. Wall time, idle time, output bounds, cancellation,
+leases, artifact collection and validation gates still apply.
+
+The JSONL progress vocabulary includes thread, turn and item events. A zero
+process exit requires a completed-turn envelope; a missing, partial or failed
+turn is not success. The last agent message is saved as the ordinary result-text
+artifact. Worker text remains untrusted and does not pass gates. Cost and token
+accounting remain UNKNOWN rather than being parsed as Claude usage or reported
+as free. Stream extraction follows Atlas's bounded, compact-envelope convention;
+it is not a general JSON validator.
+
+This adds isolated jobs, including directly submitted planner jobs. It does not
+add a repository-tree Codex driver or change `atlas plan run`'s existing Claude
+planner/tree/side driver selection. Remote submissions use whichever driver the
+operator names in gateway policy; an MCP submitter cannot choose its own driver.
+
+CLI flags and JSONL shapes are based on the installed Codex help and the
+[official noninteractive documentation](https://learn.chatgpt.com/docs/non-interactive-mode).
+Account access to Astra requires a live check on the operator's installation.

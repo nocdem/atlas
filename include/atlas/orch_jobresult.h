@@ -88,4 +88,9 @@ void atlas_orch_final_free(atlas_orch_final *f);
 atlas_status atlas_orch_final_from_stream(const char *stream, size_t len, atlas_orch_final *out,
                                           atlas_err *err);
 
+/* Codex JSONL: last agent message and terminal turn envelope. Cost remains
+ * unknown; no Claude result or usage vocabulary is applied to Codex output. */
+atlas_status atlas_orch_final_from_codex_stream(const char *stream, size_t len,
+                                                atlas_orch_final *out, atlas_err *err);
+
 #endif /* ATLAS_ORCH_JOBRESULT_H */

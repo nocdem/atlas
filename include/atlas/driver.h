@@ -48,6 +48,8 @@
  * every fixed flag, the optional model pair, the optional budget pair, the
  * task, and the NULL. */
 #define ATLAS_DRIVER_CLAUDE_ARGV_MAX 12u
+/* Fixed Codex flags, optional model pair, task, and NULL. */
+#define ATLAS_DRIVER_CODEX_ARGV_MAX 18u
 
 /* A14R. `--max-budget-usd` takes a decimal dollar amount. The widest value
  * `ATLAS_ORCH_MAX_COST_CENTS` can produce is "10000.00", but the buffer is
@@ -276,6 +278,11 @@ bool atlas_driver_progress_line_is_event(const char *line, size_t len);
 size_t atlas_driver_claude_build_argv(const atlas_driver_req *req, const char *exe,
                                       char budget_buf[ATLAS_DRIVER_BUDGET_ARG_MAX],
                                       const char **argv_out, size_t cap);
+
+/* Isolated Codex exec; refuses unsupported cost bounds and repo-tree requests.
+ * Arguments borrow the request, including the workspace artifact path. */
+size_t atlas_driver_codex_build_argv(const atlas_driver_req *req, const char *exe,
+                                     const char **argv_out, size_t cap);
 
 const atlas_driver *atlas_driver_find(const char *name);
 

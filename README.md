@@ -47,7 +47,8 @@ control layer beside them.
   state and deterministic stale/impact assessment.
 - **AI integration:** Claude Code hooks and MCP tools expose bounded reads and
   proposal-only writes. Repository prose is labelled as untrusted data.
-- **Bounded orchestration:** durable jobs, leases, crash recovery, isolated
+- **Bounded orchestration:** Claude and Codex/Astra isolated job drivers, durable
+  jobs, leases, crash recovery, isolated
   workspaces, operator-supplied gates, bounded parallel tasks and multi-stage
   planned runs. A worker result is an artifact, not authority.
 - **Remote read access and remote submission:** scoped credentials, remote MCP,

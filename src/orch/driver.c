@@ -3,8 +3,8 @@
  *
  * See atlas/driver.h for what a driver may and may not decide.
  *
- * Six drivers ship, in three pairs, and every pair is a real driver beside a
- * deterministic double that stands exactly where it stands.
+ * The Claude drivers and deterministic doubles retain their original roles.
+ * Codex adds isolated executor and planner drivers using an operator session.
  *
  * A8's pair works inside an isolated job workspace: a deterministic `fake` that
  * runs entirely in process, and `claude`, which executes the installed Claude
@@ -112,8 +112,8 @@ typedef struct capture {
 #define ATLAS_DRIVER_PROGRESS_MAX_EVENTS 5000
 #define ATLAS_DRIVER_PROGRESS_MAX_BYTES (1024 * 1024)
 
-/* The top-level record types Claude Code emits on a stream-json run, as
- * observed from the installed 2.1.235 and from nothing else.
+/* The top-level Claude stream-json and Codex JSONL progress vocabularies.
+ * Codex event names follow the official noninteractive CLI documentation.
  *
  * This is a checked vocabulary, in the A2 sense, not a parser: a record counts
  * as progress when it is a complete line that opens with `{"type":"` naming one
@@ -123,7 +123,10 @@ typedef struct capture {
  * buys a worker nothing except a refreshed idle clock, and the wall deadline is
  * the bound that actually stops it. */
 static const char *const PROGRESS_TYPES[] = {"system", "assistant", "user", "result",
-                                             "rate_limit_event", "stream_event"};
+                                             "rate_limit_event", "stream_event",
+                                             "thread.started", "turn.started", "turn.completed",
+                                             "turn.failed", "item.started", "item.updated",
+                                             "item.completed", "error"};
 
 /* The tool names worth naming in the progress record. Anything else is recorded
  * as a tool use without a name rather than with one Atlas did not expect. */
@@ -551,16 +554,54 @@ size_t atlas_driver_claude_build_argv(const atlas_driver_req *req, const char *e
     return k;
 }
 
-/* The Claude Code CLI, executed once, noninteractively.
+/* Codex has no per-invocation dollar ceiling. Refuse every nonzero bound,
+ * including malformed negative values, before building a runnable vector. */
+size_t atlas_driver_codex_build_argv(const atlas_driver_req *req, const char *exe,
+                                     const char **argv_out, size_t cap) {
+    if (argv_out == NULL || cap == 0) return 0;
+    argv_out[0] = NULL;
+    if (req == NULL || req->ws == NULL || req->work_dir != NULL ||
+        exe == NULL || exe[0] != '/' || req->task == NULL ||
+        req->max_cost_cents != 0) return 0;
+    const bool model = req->model != NULL && req->model[0] != '\0';
+    const size_t n = 15u + (model ? 2u : 0u);
+    if (cap < n + 1u) return 0;
+    size_t k = 0;
+    argv_out[k++] = exe;
+    argv_out[k++] = "--ask-for-approval";
+    argv_out[k++] = "never";
+    argv_out[k++] = "exec";
+    argv_out[k++] = "--json";
+    argv_out[k++] = "--ephemeral";
+    argv_out[k++] = "--skip-git-repo-check";
+    argv_out[k++] = "--sandbox";
+    argv_out[k++] = "workspace-write";
+    argv_out[k++] = "--add-dir";
+    argv_out[k++] = atlas_buf_cstr(&req->ws->artifacts);
+    argv_out[k++] = "--color";
+    argv_out[k++] = "never";
+    if (model) {
+        argv_out[k++] = "--model";
+        argv_out[k++] = req->model;
+    }
+    /* End options even when a submitted task begins with a dash. */
+    argv_out[k++] = "--";
+    argv_out[k++] = req->task;
+    argv_out[k] = NULL;
+    return k;
+}
+
+/* A model CLI, executed once, noninteractively.
  *
- * One implementation for both drivers that use it. What differs between them is
+ * Shared process bounds and log handling. Provider-specific arguments,
+ * credentials and stream extraction stay explicit. What differs otherwise is
  * *where the child runs* and *where its log goes*, and both are already
  * parameters: `req->work_dir` and `req->ws`. Two copies of this function would
  * be two places for the environment construction, the credential handling and
  * the exit classification to drift apart, and the exit classification is the
  * part that decides whether a zero exit is read as success. */
-static atlas_status claude_exec(const atlas_driver_req *req, atlas_driver_res *res,
-                                atlas_err *err) {
+static atlas_status model_exec(const atlas_driver_req *req, atlas_driver_res *res,
+                               bool codex, atlas_err *err) {
     atlas_status st = ATLAS_OK;
     if (!req->live_model) {
         return atlas_err_set(err, ATLAS_ERR_CONFIG,
@@ -568,6 +609,14 @@ static atlas_status claude_exec(const atlas_driver_req *req, atlas_driver_res *r
                              "(live_model = off)");
     }
 
+    if (codex && req->max_cost_cents != 0) {
+        return atlas_err_set(err, ATLAS_ERR_CONFIG,
+                             "codex cannot enforce max_cost_usd; the configured budget was not discarded");
+    }
+    if (codex && !req->operator_session) {
+        return atlas_err_set(err, ATLAS_ERR_CONFIG,
+                             "codex requires model_credential = operator_session; service credentials are unsupported");
+    }
     atlas_buf cred = ATLAS_BUF_INIT;
     bool have_cred = false;
     if (!req->operator_session) {
@@ -590,7 +639,7 @@ static atlas_status claude_exec(const atlas_driver_req *req, atlas_driver_res *r
     }
 
     atlas_buf exe = ATLAS_BUF_INIT;
-    st = atlas_proc_which("claude", "/usr/local/bin:/usr/bin:/bin", &exe, err);
+    st = atlas_proc_which(codex ? "codex" : "claude", "/usr/local/bin:/usr/bin:/bin", &exe, err);
     if (st != ATLAS_OK) {
         atlas_buf_free(&cred);
         atlas_buf_free(&exe);
@@ -690,12 +739,14 @@ static atlas_status claude_exec(const atlas_driver_req *req, atlas_driver_res *r
     /* The vector is built by one pure function, so what a worker is actually
      * executed with is a thing a test can read rather than a thing this
      * function alone knows. */
-    const char *argv[ATLAS_DRIVER_CLAUDE_ARGV_MAX];
+    const char *argv[ATLAS_DRIVER_CODEX_ARGV_MAX];
     char budget_arg[ATLAS_DRIVER_BUDGET_ARG_MAX];
     budget_arg[0] = '\0';
     if (st == ATLAS_OK &&
-        atlas_driver_claude_build_argv(req, atlas_buf_cstr(&exe), budget_arg, argv,
-                                       ATLAS_DRIVER_CLAUDE_ARGV_MAX) == 0) {
+        (codex ? atlas_driver_codex_build_argv(req, atlas_buf_cstr(&exe), argv,
+                                               ATLAS_DRIVER_CODEX_ARGV_MAX)
+               : atlas_driver_claude_build_argv(req, atlas_buf_cstr(&exe), budget_arg, argv,
+                                                ATLAS_DRIVER_CODEX_ARGV_MAX)) == 0) {
         st = atlas_err_set(err, ATLAS_ERR_INTERNAL,
                            "the driver's command line could not be built");
         /* Classified below as a run that never started, which is what it is,
@@ -803,7 +854,7 @@ static atlas_status claude_exec(const atlas_driver_req *req, atlas_driver_res *r
     res->events = out.events;
     /* A10.0. Read once, from the stream Atlas captured, and never from anything
      * the worker asserted about itself in a separate document. */
-    atlas_usage_from_stream(out.out.data, out.out.len, &res->usage);
+    if (!codex) atlas_usage_from_stream(out.out.data, out.out.len, &res->usage);
 
     /* A14R. The other two things the same final record carries: what the worker
      * answered, and why it stopped.
@@ -816,8 +867,14 @@ static atlas_status claude_exec(const atlas_driver_req *req, atlas_driver_res *r
         atlas_orch_final fin;
         atlas_err fin_err;
         atlas_err_init(&fin_err);
-        if (atlas_orch_final_from_stream(out.out.data, out.out.len, &fin, &fin_err) == ATLAS_OK &&
-            fin.present) {
+        atlas_status fs = codex
+            ? atlas_orch_final_from_codex_stream(out.out.data, out.out.len, &fin, &fin_err)
+            : atlas_orch_final_from_stream(out.out.data, out.out.len, &fin, &fin_err);
+        if (codex && res->exit_kind == ATLAS_ORCH_EXIT_OK &&
+            (fs != ATLAS_OK || !fin.present || fin.subtype != ATLAS_ORCH_RESULT_SUBTYPE_SUCCESS)) {
+            res->exit_kind = ATLAS_ORCH_EXIT_MALFORMED_RESULT;
+        }
+        if (fs == ATLAS_OK && fin.present) {
             /* The answer becomes an ordinary artifact, so it travels, is
              * digested, is bounded and is read by exactly the machinery every
              * other artifact already goes through. Written after the child has
@@ -863,7 +920,7 @@ static atlas_status claude_run(const atlas_driver_req *req, atlas_driver_res *re
         return atlas_err_set(err, ATLAS_ERR_USAGE,
                              "the claude driver runs in an isolated workspace and was given none");
     }
-    return claude_exec(req, res, err);
+    return model_exec(req, res, false, err);
 }
 
 /* --- A11.1: the two drivers that work in the repository's own tree -----------
@@ -900,7 +957,7 @@ static atlas_status claude_repo_run(const atlas_driver_req *req, atlas_driver_re
                              "the claude-repo driver needs an absolute working directory "
                              "resolved by Atlas and was given none");
     }
-    return claude_exec(req, res, err);
+    return model_exec(req, res, false, err);
 }
 
 /* The repository-tree counterpart of `fake`, and the reason the ten A11.1
@@ -1036,7 +1093,7 @@ static atlas_status claude_plan_run(const atlas_driver_req *req, atlas_driver_re
                              "the claude-plan driver runs in an isolated workspace and was given "
                              "none");
     }
-    return claude_exec(req, res, err);
+    return model_exec(req, res, false, err);
 }
 
 /* The line that selects `fake-plan`'s behaviour, matched as a whole line and as
@@ -1134,6 +1191,26 @@ static atlas_status fake_plan_run(const atlas_driver_req *req, atlas_driver_res 
     return st;
 }
 
+static atlas_status codex_run(const atlas_driver_req *req, atlas_driver_res *res,
+                              atlas_err *err) {
+    atlas_status st = atlas_buf_set_str(&res->version, "codex/1", err);
+    if (st != ATLAS_OK) return st;
+    if (req->ws == NULL || req->work_dir != NULL) {
+        return atlas_err_set(err, ATLAS_ERR_CONFIG, "codex requires an isolated workspace");
+    }
+    return model_exec(req, res, true, err);
+}
+
+static atlas_status codex_plan_run(const atlas_driver_req *req, atlas_driver_res *res,
+                                   atlas_err *err) {
+    atlas_status st = atlas_buf_set_str(&res->version, "codex-plan/1", err);
+    if (st != ATLAS_OK) return st;
+    if (req->ws == NULL || req->work_dir != NULL) {
+        return atlas_err_set(err, ATLAS_ERR_CONFIG, "codex-plan requires an isolated workspace");
+    }
+    return model_exec(req, res, true, err);
+}
+
 /* --- the registry ----------------------------------------------------------- */
 
 static const atlas_driver DRIVER_FAKE = {
@@ -1155,9 +1232,17 @@ static const atlas_driver DRIVER_FAKE_PLAN = {
     .name = "fake-plan", .version = "1", .needs_live_model = false,
     .role = ATLAS_DRIVER_ROLE_PLANNER, .run = fake_plan_run};
 
+static const atlas_driver DRIVER_CODEX = {
+    .name = "codex", .version = "1", .needs_live_model = true,
+    .role = ATLAS_DRIVER_ROLE_EXECUTOR, .run = codex_run};
+static const atlas_driver DRIVER_CODEX_PLAN = {
+    .name = "codex-plan", .version = "1", .needs_live_model = true,
+    .role = ATLAS_DRIVER_ROLE_PLANNER, .run = codex_plan_run};
+
 static const atlas_driver *const DRIVERS[] = {&DRIVER_FAKE,      &DRIVER_CLAUDE,
                                               &DRIVER_CLAUDE_REPO, &DRIVER_FAKE_REPO,
-                                              &DRIVER_CLAUDE_PLAN, &DRIVER_FAKE_PLAN};
+                                              &DRIVER_CLAUDE_PLAN, &DRIVER_FAKE_PLAN,
+                                              &DRIVER_CODEX, &DRIVER_CODEX_PLAN};
 
 const char *atlas_driver_model_for(const atlas_driver *d, const atlas_driver_models *m) {
     const char *name = NULL;

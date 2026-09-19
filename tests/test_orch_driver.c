@@ -258,6 +258,8 @@ static void test_every_driver_declares_the_role_it_works_in(void) {
     } WANT[] = {
         {"fake", ATLAS_DRIVER_ROLE_NONE, false},
         {"claude", ATLAS_DRIVER_ROLE_EXECUTOR, true},
+        {"codex", ATLAS_DRIVER_ROLE_EXECUTOR, true},
+        {"codex-plan", ATLAS_DRIVER_ROLE_PLANNER, true},
         {"claude-repo", ATLAS_DRIVER_ROLE_EXECUTOR, true},
         {"fake-repo", ATLAS_DRIVER_ROLE_NONE, false},
         {"claude-plan", ATLAS_DRIVER_ROLE_PLANNER, true},
@@ -292,6 +294,7 @@ static void test_the_model_a_driver_runs_under_follows_its_role(void) {
         const char *want;
     } CASES[] = {
         {"claude-plan", "plan-model"}, {"fake-plan", "plan-model"},
+        {"codex-plan", "plan-model"}, {"codex", "exec-model"},
         {"claude", "exec-model"},      {"claude-repo", "exec-model"},
         {"fake", ""},                  {"fake-repo", ""},
     };
@@ -946,7 +949,96 @@ static void test_a_streamed_record_is_recognised_and_prose_is_not(void) {
     }
 }
 
+static void test_codex_arguments_and_refusals(void) {
+    denv e;
+    denv_open(&e);
+    atlas_driver_req req;
+    fill_req(&e, &req, "--model=wrong $(touch bad); quoted task");
+    const char *args[ATLAS_DRIVER_CODEX_ARGV_MAX];
+    req.model = "gpt-6-astra";
+    size_t n = atlas_driver_codex_build_argv(&req, "/usr/bin/codex", args,
+                                            ATLAS_DRIVER_CODEX_ARGV_MAX);
+    T_EQ_INT(n, 17);
+    T_REQUIRE(n > 0);
+    T_CHECK(args[n] == NULL);
+    T_CHECK(strcmp(args[n - 2], "--") == 0);
+    T_CHECK(strcmp(args[n - 1], req.task) == 0);
+    T_CHECK(strcmp(args[8], "workspace-write") == 0);
+    T_CHECK(strcmp(args[10], atlas_buf_cstr(&e.ws.artifacts)) == 0);
+    T_CHECK(strcmp(args[14], "gpt-6-astra") == 0);
+    T_CHECK(atlas_driver_codex_build_argv(&req, "/usr/bin/codex", args, n) == 0);
+    T_CHECK(args[0] == NULL);
+    req.model = NULL;
+    T_EQ_INT(atlas_driver_codex_build_argv(&req, "/usr/bin/codex", args,
+                                           ATLAS_DRIVER_CODEX_ARGV_MAX), 15);
+    atlas_driver_res res;
+    atlas_driver_res_init(&res);
+    atlas_err err;
+    atlas_err_init(&err);
+    const atlas_driver *d = atlas_driver_find("codex");
+    T_REQUIRE(d != NULL);
+    T_FAILS_WITH(d->run(&req, &res, &err), ATLAS_ERR_CONFIG, &err);
+    req.live_model = true;
+    T_FAILS_WITH(d->run(&req, &res, &err), ATLAS_ERR_CONFIG, &err);
+    T_CHECK(strstr(atlas_err_msg(&err), "operator_session") != NULL);
+    req.operator_session = true;
+    req.max_cost_cents = 1;
+    T_FAILS_WITH(d->run(&req, &res, &err), ATLAS_ERR_CONFIG, &err);
+    T_CHECK(strstr(atlas_err_msg(&err), "max_cost_usd") != NULL);
+    T_EQ_INT(atlas_driver_codex_build_argv(&req, "/usr/bin/codex", args,
+                                           ATLAS_DRIVER_CODEX_ARGV_MAX), 0);
+    req.max_cost_cents = -1;
+    T_EQ_INT(atlas_driver_codex_build_argv(&req, "/usr/bin/codex", args,
+                                           ATLAS_DRIVER_CODEX_ARGV_MAX), 0);
+    req.max_cost_cents = 0;
+    req.work_dir = "/tmp";
+    T_FAILS_WITH(d->run(&req, &res, &err), ATLAS_ERR_CONFIG, &err);
+    req.work_dir = NULL;
+    req.ws = NULL;
+    T_FAILS_WITH(atlas_driver_find("codex-plan")->run(&req, &res, &err), ATLAS_ERR_CONFIG, &err);
+    T_CHECK(!atlas_orch_driver_is_repo_tree("codex"));
+    T_CHECK(!atlas_orch_driver_is_repo_tree("codex-plan"));
+    atlas_driver_res_free(&res);
+    denv_close(&e);
+}
+
+static void test_codex_stream_is_distinct_from_claude(void) {
+    static const char STREAM[] =
+        "{\"type\":\"thread.started\",\"thread_id\":\"example\"}\n"
+        "{\"type\":\"turn.started\"}\n"
+        "{\"type\":\"item.completed\",\"item\":{\"id\":\"i1\",\"type\":\"agent_message\","
+        "\"text\":\"done\\nwith words\"}}\n"
+        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}\n";
+    atlas_err err;
+    atlas_err_init(&err);
+    atlas_orch_final f;
+    T_OK(atlas_orch_final_from_codex_stream(STREAM, strlen(STREAM), &f, &err), &err);
+    T_CHECK(f.present);
+    T_EQ_INT(f.subtype, ATLAS_ORCH_RESULT_SUBTYPE_SUCCESS);
+    T_CHECK(strstr(atlas_buf_cstr(&f.text), "done\nwith") != NULL);
+    atlas_orch_final_free(&f);
+    static const char FAILED[] = "{\"type\":\"turn.failed\",\"error\":{\"message\":\"no quota\"}}\n";
+    T_OK(atlas_orch_final_from_codex_stream(FAILED, strlen(FAILED), &f, &err), &err);
+    T_CHECK(f.present);
+    T_EQ_INT(f.subtype, ATLAS_ORCH_RESULT_SUBTYPE_ERROR_DURING_EXECUTION);
+    atlas_orch_final_free(&f);
+    static const char *const ABSENT[] = {
+        "", "plain text", "{\"type\":\"turn.completed\",",
+        "{\"type\":\"result\",\"subtype\":\"success\"}",
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"hello\"}}"
+    };
+    for (size_t i = 0; i < sizeof ABSENT / sizeof ABSENT[0]; i++) {
+        T_OK(atlas_orch_final_from_codex_stream(ABSENT[i], strlen(ABSENT[i]), &f, &err), &err);
+        T_CHECK(!f.present);
+        atlas_orch_final_free(&f);
+    }
+    const char *progress = "{\"type\":\"item.updated\",\"item\":{}}";
+    T_CHECK(atlas_driver_progress_line_is_event(progress, strlen(progress)));
+}
+
 static const atlas_test TESTS[] = {
+    {"codex arguments and refusals", test_codex_arguments_and_refusals},
+    {"codex stream is distinct from claude", test_codex_stream_is_distinct_from_claude},
     {"a_streamed_record_is_recognised_and_prose_is_not",
      test_a_streamed_record_is_recognised_and_prose_is_not},
     {"an unknown driver is refused and never defaulted",

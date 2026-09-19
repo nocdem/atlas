@@ -150,14 +150,13 @@ static int hexval(char c) {
  * reason to discard what was already read: the prefix is what a reviewer would
  * be shown either way, and silently returning nothing is the failure mode this
  * season exists to end. */
-static atlas_status take_text(const char *p, const char *end, atlas_orch_final *out,
+static atlas_status take_text(const char *p, const char *end, const char *key, atlas_orch_final *out,
                               atlas_err *err) {
-    static const char KEY[] = "\"result\":\"";
-    const char *at = find_key(p, end, KEY);
+    const char *at = find_key(p, end, key);
     if (at == NULL) {
         return ATLAS_OK;
     }
-    at += sizeof KEY - 1u;
+    at += strlen(key);
     bool stored = true;
     atlas_status st = ATLAS_OK;
     while (st == ATLAS_OK && at < end) {
@@ -266,5 +265,50 @@ atlas_status atlas_orch_final_from_stream(const char *stream, size_t len, atlas_
     }
     out->present = true;
     out->subtype = take_subtype(best, best + best_len);
-    return take_text(best, best + best_len, out, err);
+    return take_text(best, best + best_len, "\"result\":\"", out, err);
+}
+
+/* Codex's documented compact JSONL envelope. Only top-level event prefixes
+ * are recognised; text inside a message cannot announce a completed turn.
+ * Like the Claude scanner this is bounded extraction, not a JSON validator.
+ * The subprocess outcome and Atlas gates remain authoritative. */
+atlas_status atlas_orch_final_from_codex_stream(const char *stream, size_t len,
+                                                atlas_orch_final *out, atlas_err *err) {
+    atlas_orch_final_init(out);
+    if (stream == NULL) return ATLAS_OK;
+    const char *p = stream, *end = stream + len;
+    const char *answer = NULL;
+    size_t answer_len = 0;
+    while (p < end) {
+        const char *nl = memchr(p, '\n', (size_t)(end - p));
+        const char *stop = nl != NULL ? nl : end;
+        while (stop > p && (stop[-1] == '\r' || stop[-1] == ' ')) stop--;
+        size_t n = (size_t)(stop - p);
+        if (n > 2u && p[0] == '{' && stop[-1] == '}') {
+            static const char ITEM[] = "{\"type\":\"item.completed\",\"item\":{";
+            static const char DONE[] = "{\"type\":\"turn.completed\",";
+            static const char FAIL[] = "{\"type\":\"turn.failed\",";
+            if (n >= sizeof ITEM - 1u && memcmp(p, ITEM, sizeof ITEM - 1u) == 0 &&
+                find_key(p, stop, "\"type\":\"agent_message\"") != NULL) {
+                answer = p;
+                answer_len = n;
+            } else if (n >= sizeof DONE - 1u && memcmp(p, DONE, sizeof DONE - 1u) == 0) {
+                out->present = true;
+                out->subtype = ATLAS_ORCH_RESULT_SUBTYPE_SUCCESS;
+            } else if (n >= sizeof FAIL - 1u && memcmp(p, FAIL, sizeof FAIL - 1u) == 0) {
+                out->present = true;
+                out->subtype = ATLAS_ORCH_RESULT_SUBTYPE_ERROR_DURING_EXECUTION;
+            } else if (n == sizeof "{\"type\":\"turn.started\"}" - 1u &&
+                       memcmp(p, "{\"type\":\"turn.started\"}", n) == 0) {
+                out->present = false;
+                out->subtype = ATLAS_ORCH_RESULT_SUBTYPE_UNKNOWN;
+                answer = NULL;
+            }
+        }
+        p = nl != NULL ? nl + 1 : end;
+    }
+    if (answer != NULL) {
+        return take_text(answer, answer + answer_len, "\"text\":\"", out, err);
+    }
+    return ATLAS_OK;
 }
